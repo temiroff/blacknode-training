@@ -1,0 +1,104 @@
+{
+  "kind": "blacknode.workflow",
+  "schema_version": 1,
+  "name": "Blacknode Native ACT Training",
+  "saved_at": "2026-07-16T00:00:00",
+  "entrypoint": {
+    "node_id": "training",
+    "port": "dashboard"
+  },
+  "metadata": {
+    "template": true,
+    "description": "Validate ACT-style HDF5 robot episodes, configure a native action-chunking transformer, and explicitly start or monitor a managed training job. Starts in status mode and never commands robot motion.",
+    "color": "#f97316",
+    "required_packages": [
+      "blacknode-training"
+    ]
+  },
+  "node_meta": {
+    "dataset_path": {
+      "id": "dataset_path",
+      "type": "Text",
+      "pos": [80, 180],
+      "params": {
+        "value": "C:\\path\\to\\dataset-hdf5"
+      },
+      "inputs": [],
+      "outputs": ["value"],
+      "input_types": {},
+      "output_types": {"value": "Text"},
+      "input_defaults": {}
+    },
+    "dataset_check": {
+      "id": "dataset_check",
+      "type": "TrainingDatasetCheck",
+      "pos": [430, 160],
+      "params": {"dataset_path": ""},
+      "inputs": ["trigger", "dataset_path"],
+      "outputs": ["ok", "dataset", "episode_count", "frame_count", "report"],
+      "input_types": {"trigger": "Any", "dataset_path": "Text"},
+      "output_types": {"ok": "Bool", "dataset": "Dict", "episode_count": "Int", "frame_count": "Int", "report": "Text"},
+      "input_defaults": {"dataset_path": ""}
+    },
+    "training": {
+      "id": "training",
+      "type": "ACTTraining",
+      "pos": [820, 100],
+      "params": {
+        "action": "status",
+        "run_id": "act-training",
+        "dataset_path": "",
+        "output_dir": "",
+        "device": "auto",
+        "steps": 5000,
+        "batch_size": 8,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.0001,
+        "chunk_size": 32,
+        "hidden_dim": 256,
+        "attention_heads": 8,
+        "encoder_layers": 4,
+        "decoder_layers": 2,
+        "validation_fraction": 0.1,
+        "eval_every": 250,
+        "checkpoint_every": 1000,
+        "seed": 42,
+        "resume": false
+      },
+      "inputs": [
+        "trigger", "action", "run_id", "dataset_path", "output_dir", "device",
+        "steps", "batch_size", "learning_rate", "weight_decay", "chunk_size",
+        "hidden_dim", "attention_heads", "encoder_layers", "decoder_layers",
+        "validation_fraction", "eval_every", "checkpoint_every", "seed", "resume"
+      ],
+      "outputs": ["ok", "running", "phase", "step", "status", "dashboard", "checkpoint", "report"],
+      "input_types": {
+        "trigger": "Any", "action": "Text", "run_id": "Text", "dataset_path": "Text", "output_dir": "Text",
+        "device": "Text", "steps": "Int", "batch_size": "Int", "learning_rate": "Float", "weight_decay": "Float",
+        "chunk_size": "Int", "hidden_dim": "Int", "attention_heads": "Int", "encoder_layers": "Int",
+        "decoder_layers": "Int", "validation_fraction": "Float", "eval_every": "Int", "checkpoint_every": "Int",
+        "seed": "Int", "resume": "Bool"
+      },
+      "output_types": {
+        "ok": "Bool", "running": "Bool", "phase": "Text", "step": "Int", "status": "Dict",
+        "dashboard": "Image", "checkpoint": "Text", "report": "Text"
+      },
+      "input_defaults": {
+        "action": "status", "run_id": "act-training", "dataset_path": "", "output_dir": "", "device": "auto",
+        "steps": 5000, "batch_size": 8, "learning_rate": 0.0001, "weight_decay": 0.0001,
+        "chunk_size": 32, "hidden_dim": 256, "attention_heads": 8, "encoder_layers": 4,
+        "decoder_layers": 2, "validation_fraction": 0.1, "eval_every": 250,
+        "checkpoint_every": 1000, "seed": 42, "resume": false
+      },
+      "input_choices": {
+        "action": ["status", "check", "start", "stop"],
+        "device": ["auto", "cuda", "cpu"]
+      }
+    }
+  },
+  "edges": [
+    {"from": "dataset_path", "from_port": "value", "to": "dataset_check", "to_port": "dataset_path"},
+    {"from": "dataset_path", "from_port": "value", "to": "training", "to_port": "dataset_path"},
+    {"from": "dataset_check", "from_port": "report", "to": "training", "to_port": "trigger"}
+  ]
+}

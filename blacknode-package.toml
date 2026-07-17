@@ -1,0 +1,12 @@
+[package]
+name = "blacknode-training"
+version = "0.1.0"
+description = "Blacknode-native offline robot policy training and prediction-only evaluation."
+requires-blacknode = ">=0.1.0"
+
+[categories]
+"Training" = "#f97316"
+
+[dependencies]
+pip = ["torch>=2.4", "h5py>=3.11", "numpy>=1.24"]
+imports = ["torch", "h5py", "numpy"]
