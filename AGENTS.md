@@ -34,3 +34,9 @@ $env:PYTHONPATH="python"
 python -m pytest packages/blacknode-training/tests
 blacknode validate packages/blacknode-training/templates/act-training.json
 ```
+
+## Documentation voice
+
+Describe Blacknode datasets, training jobs, model architecture, checkpoints,
+metrics, and policy preview directly. Do not position the package against other
+training products or describe speculative integrations in public docs.
