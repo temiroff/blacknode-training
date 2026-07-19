@@ -1,7 +1,7 @@
 [package]
 name = "blacknode-training"
-version = "0.1.0"
-description = "Blacknode-native offline robot policy training and prediction-only evaluation."
+version = "0.2.0"
+description = "Blacknode-native robot policy training, resumable checkpoints, previews, and policy artifacts."
 requires-blacknode = ">=0.1.0"
 
 [categories]

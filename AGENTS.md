@@ -6,7 +6,7 @@ commit its Git state separately from the containing Blacknode checkout.
 ## Scope
 
 Own offline robot-policy dataset inspection, PyTorch training, checkpoints,
-metrics, and prediction-only evaluation. Do not own recording, hardware
+metrics, prediction-only evaluation, and inference artifact export. Do not own recording, hardware
 discovery, ROS transport, or robot motion.
 
 ## Rules

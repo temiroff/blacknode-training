@@ -22,18 +22,28 @@ focused on acquisition.
 ## Workflow
 
 1. Record successful episodes with `blacknode-dataset`.
-2. Run `EpisodeDatasetValidate`.
-3. Use `HDF5EpisodeExport` with `action=export` and `include_images=true`.
-4. Open **Blacknode Native ACT Training**.
-5. Set the HDF5 directory in the `Text` node.
-6. Set `ACTTraining.action=check` and cook the dashboard.
-7. Choose `action=start` only after the dataset and output settings are valid.
-8. Return the action to `status` to monitor the current job.
-9. Use `action=stop` for a cooperative stop; the latest completed step is
+2. Open **Blacknode Native ACT Training**.
+3. Use `DatasetBrowser` to choose the dataset root and dataset ID.
+4. Inspect the selected episode and camera, then run `EpisodeDatasetValidate`.
+5. Set `HDF5EpisodeExport.action=export` with `include_images=true` and cook it
+   once. Return the action to `check` after the export is ready.
+6. Confirm `TrainingDatasetCheck` reports the expected episodes, joints, and
+   cameras.
+7. Set `ACTTraining.action=check` and cook the dashboard.
+8. Choose `action=start` only after the dataset and output settings are valid.
+9. Return the action to `status` to monitor the current job.
+10. Use `action=stop` for a cooperative stop; the latest completed step is
    checkpointed and can be resumed with `resume=true`.
+11. Export the checkpoint, load it with `PolicyArtifactLoad`, and set
+    `ACTPolicyReplay.action=evaluate` for the selected Dataset Browser episode.
+12. Start the connected `StreamPublisher`. Playing or seeking the Dataset
+    Browser sends policy-predicted actions to the external evaluation apps.
 
-The template defaults to `status`. Cooking a graph never implicitly starts
-training.
+The browser selects the Blacknode-native dataset. The HDF5 export node produces
+the ACT training view and passes its path directly into dataset checking,
+training, and policy preview. The export defaults to `check`, and training
+defaults to `status`, so cooking the graph never implicitly exports data or
+starts training.
 
 ## Nodes
 
@@ -43,6 +53,9 @@ training.
 | `ACTTraining` | Check, start, monitor, stop, or resume one managed background training run. Its dashboard shows phase, progress, train loss, validation loss, and failures. |
 | `ACTCheckpointInspect` | Read the fixed schema, normalization statistics, split, model configuration, step, and metrics from a checkpoint. |
 | `ACTPolicyPreview` | Predict and display a denormalized future action chunk for one recorded frame. |
+| `ACTPolicyExport` | Export model weights, schema, normalization, camera order, joint order, and metrics as an inference-only policy artifact. |
+| `PolicyArtifactLoad` | Validate and load an exported policy manifest for a deployment workflow. |
+| `ACTPolicyReplay` | Evaluate a loaded artifact across every frame in one recorded episode, report prediction error, and emit a browser-synchronized replay stream. |
 
 ## Training contract
 
@@ -86,6 +99,19 @@ Each checkpoint includes model and optimizer state, model configuration,
 normalization statistics, dataset joint/camera schema, episode split, training
 configuration, and metrics. Writes use a temporary file and atomic rename.
 Only load checkpoints produced locally or by a trusted source.
+
+`ACTPolicyExport` writes `manifest.json` plus `model.pt`. The manifest is the
+stable handoff to Blacknode policy runtimes and declares absolute joint-position
+actions in radians, ordered joints and cameras, normalization statistics, and
+the source training step. The exported model omits optimizer state.
+
+`ACTPolicyReplay` checks the artifact and HDF5 dataset contracts before loading
+the model. Evaluation produces predicted actions, recorded targets, per-joint
+absolute error, episode MAE/RMSE/max error, and a `blacknode.replay-stream`
+handle. Connect that handle to `StreamPublisher`. When `sync_stream` receives
+`DatasetBrowser.stream`, the recorded video timeline controls policy replay, so
+Maya, ROS 2, Isaac Sim, and other subscribers see the prediction for the frame
+currently under review. This inference-only path never publishes robot commands.
 
 ## Safety and limitations
 

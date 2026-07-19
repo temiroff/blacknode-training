@@ -26,7 +26,10 @@ except ImportError:
     torch = None
 
 
-EXPECTED = {"TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview"}
+EXPECTED = {
+    "TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview",
+    "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
+}
 
 
 def _write_episode(path: Path, index: int, frames: int = 5) -> None:
@@ -53,6 +56,7 @@ def test_nodes_registered_and_motion_free():
         assert definition._bn_package == "blacknode-training"
         assert definition._bn_category == "Training"
     assert not any("robot" in output.lower() or "command" in output.lower() for output in _NODE_REGISTRY["ACTPolicyPreview"]._bn_outputs)
+    assert not any("robot" in output.lower() or "command" in output.lower() for output in _NODE_REGISTRY["ACTPolicyReplay"]._bn_outputs)
 
 
 def test_status_is_non_mutating_and_dashboard_is_svg():
@@ -95,6 +99,57 @@ def test_template_validates():
     assert validate_workflow(workflow).ok
     assert workflow["entrypoint"] == {"node_id": "training", "port": "dashboard"}
     assert workflow["node_meta"]["training"]["params"]["action"] == "status"
+    assert workflow["node_meta"]["hdf5_export"]["params"]["action"] == "check"
+    assert workflow["node_meta"]["dataset_browser"]["type"] == "DatasetBrowser"
+    assert workflow["node_meta"]["policy_replay"]["params"]["action"] == "check"
+    assert workflow["node_meta"]["policy_stream"]["params"]["action"] == "status"
+    assert {"blacknode-training", "blacknode-dataset"} <= set(workflow["metadata"]["required_packages"])
+    assert {
+        (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
+        for edge in workflow["edges"]
+    } >= {
+        ("dataset_browser", "dataset", "dataset_validate", "dataset"),
+        ("dataset_browser", "dataset", "hdf5_export", "dataset"),
+        ("hdf5_export", "path", "training", "dataset_path"),
+        ("policy_load", "artifact", "policy_replay", "artifact"),
+        ("dataset_browser", "stream", "policy_replay", "sync_stream"),
+        ("policy_replay", "stream", "policy_stream", "stream"),
+    }
+
+
+@pytest.mark.skipif(h5py is None, reason="h5py is installed by package setup")
+def test_policy_replay_contract_without_loading_real_model(tmp_path: Path, monkeypatch):
+    _write_episode(tmp_path, 0)
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    (policy_dir / "model.pt").write_bytes(b"synthetic")
+    artifact = {
+        "kind": "blacknode.policy-artifact", "schema_version": 1,
+        "policy_type": "act", "backend": "blacknode-native",
+        "path": str(policy_dir), "model_file": "model.pt", "step": 7,
+        "units": "radians", "state_dim": 2, "action_dim": 2,
+        "joint_names": ["shoulder", "gripper"], "camera_names": ["front"],
+    }
+
+    class FakePolicy:
+        def __init__(self, _artifact, _device):
+            pass
+
+        def predict(self, qpos, _images):
+            return {"action": list(qpos), "action_chunk": [list(qpos)]}
+
+    monkeypatch.setattr(data, "torch", object())
+    monkeypatch.setattr(runtime, "ACTPolicy", FakePolicy)
+    replayed = _NODE_REGISTRY["ACTPolicyReplay"]({
+        "action": "evaluate", "artifact": artifact, "dataset_path": str(tmp_path),
+        "episode": {"episode_index": 0}, "device": "cpu",
+        "sync_stream": {"kind": "blacknode.replay-stream", "token": "browser-token"},
+    })
+    assert replayed["ok"] and replayed["evaluated"]
+    assert replayed["frame_count"] == 5
+    assert replayed["stream"]["source_token"] == "browser-token"
+    assert replayed["stream"]["frames_data"][0]["motion_commanded"] is False
+    assert replayed["metrics"]["mean_absolute_error"] == pytest.approx(0.1)
 
 
 @pytest.mark.skipif(h5py is None or torch is None, reason="h5py and torch are installed by package setup")
@@ -129,3 +184,34 @@ def test_dataset_training_checkpoint_and_preview(tmp_path: Path):
     assert len(prediction["absolute_error"]) == 2
     assert len(prediction["action_chunk"]) == 3
     assert prediction["motion_commanded"] is False
+    artifact = runtime.export_policy_artifact(checkpoint, tmp_path / "policy")
+    assert artifact["kind"] == "blacknode.policy-artifact"
+    assert artifact["joint_names"] == ["shoulder", "gripper"]
+    policy = runtime.ACTPolicy(artifact, "cpu")
+    live_prediction = policy.predict(
+        [0.0, 0.1], {"front": np.full((16, 20, 3), 20, dtype=np.uint8)},
+    )
+    assert len(live_prediction["action"]) == 2
+    exported = _NODE_REGISTRY["ACTPolicyExport"]({
+        "action": "check", "checkpoint_path": str(checkpoint),
+    })
+    assert exported["ok"] and not exported["exported"]
+    loaded = _NODE_REGISTRY["PolicyArtifactLoad"]({"artifact_path": artifact["path"]})
+    assert loaded["ok"] and loaded["artifact"]["model_path"].endswith("model.pt")
+    checked_replay = _NODE_REGISTRY["ACTPolicyReplay"]({
+        "action": "check", "artifact": loaded["artifact"], "dataset_path": str(tmp_path),
+        "episode_index": 0,
+    })
+    assert checked_replay["ok"] and not checked_replay["evaluated"]
+    assert checked_replay["frame_count"] == 5
+    replayed = _NODE_REGISTRY["ACTPolicyReplay"]({
+        "action": "evaluate", "artifact": loaded["artifact"], "dataset_path": str(tmp_path),
+        "episode_index": 0, "device": "cpu",
+        "sync_stream": {"kind": "blacknode.replay-stream", "token": "recorded-episode"},
+    })
+    assert replayed["ok"] and replayed["evaluated"]
+    assert replayed["stream"]["kind"] == "blacknode.replay-stream"
+    assert replayed["stream"]["source_token"] == "recorded-episode"
+    assert len(replayed["stream"]["frames_data"]) == 5
+    assert replayed["metrics"]["mean_absolute_error"] >= 0
+    assert replayed["replay"]["motion_commanded"] is False
