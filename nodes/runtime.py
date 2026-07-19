@@ -389,6 +389,29 @@ def job_status(run_id: str) -> dict[str, Any]:
     return job.status()
 
 
+def runtime_status() -> dict[str, Any]:
+    with _jobs_lock:
+        statuses = [job.status() for job in _jobs.values() if job.thread.is_alive()]
+    return {
+        "ok": True,
+        "active": bool(statuses),
+        "managed_runs": statuses,
+        "report": f"{len(statuses)} active policy training job(s)",
+    }
+
+
+def stop_runtime_services() -> dict[str, Any]:
+    with _jobs_lock:
+        jobs = [job for job in _jobs.values() if job.thread.is_alive()]
+    for job in jobs:
+        job.stop()
+    return {
+        "ok": True,
+        "stopped": {"managed_runs": len(jobs)},
+        "report": f"requested stop for {len(jobs)} policy training job(s)",
+    }
+
+
 def checkpoint_info(checkpoint_path: str | Path) -> dict[str, Any]:
     data.require_dependencies(needs_torch=True)
     assert torch is not None
@@ -404,6 +427,286 @@ def checkpoint_info(checkpoint_path: str | Path) -> dict[str, Any]:
         "model_config": dict(payload["model_config"]),
         "dataset": dict(payload["dataset"]), "statistics": dict(payload["statistics"]),
         "metrics": dict(payload.get("metrics") or {}),
+    }
+
+
+def export_policy_artifact(
+    checkpoint_path: str | Path,
+    output_dir: str | Path = "",
+    *,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Export a checkpoint into the stable, inference-only policy contract."""
+    data.require_dependencies(needs_torch=True)
+    assert torch is not None
+    checkpoint = Path(str(checkpoint_path or "").strip()).expanduser().resolve()
+    payload = _torch_load(checkpoint, torch.device("cpu"))
+    if payload.get("kind") != "blacknode.action-chunking-checkpoint":
+        raise ValueError("checkpoint is not a Blacknode action chunking checkpoint")
+    step = int(payload.get("step") or 0)
+    raw_output = str(output_dir or "").strip()
+    output = (
+        Path(raw_output).expanduser().resolve()
+        if raw_output
+        else checkpoint.parent / f"policy-{step:08d}"
+    )
+    if output.exists() and any(output.iterdir()) and not overwrite:
+        raise FileExistsError(f"policy artifact directory is not empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    model_path = output / "model.pt"
+    temporary = model_path.with_suffix(".pt.tmp")
+    inference_payload = {
+        "kind": "blacknode.act-policy-model",
+        "schema_version": 1,
+        "model_config": dict(payload["model_config"]),
+        "model_state": payload["model_state"],
+    }
+    torch.save(inference_payload, temporary)
+    temporary.replace(model_path)
+    trained = dict(payload["dataset"])
+    manifest = {
+        "kind": "blacknode.policy-artifact",
+        "schema_version": 1,
+        "policy_type": "act",
+        "backend": "blacknode-native",
+        "created_at": _now(),
+        "path": str(output),
+        "model_file": model_path.name,
+        "source_checkpoint": str(checkpoint),
+        "step": step,
+        "action_mode": "absolute_joint_position",
+        "units": "radians",
+        "joint_names": list(trained["joint_names"]),
+        "camera_names": list(trained["cameras"]),
+        "fps": int(trained.get("fps") or 0),
+        "state_dim": int(trained["state_dim"]),
+        "action_dim": int(trained["action_dim"]),
+        "model_config": dict(payload["model_config"]),
+        "statistics": dict(payload["statistics"]),
+        "metrics": dict(payload.get("metrics") or {}),
+    }
+    _atomic_json(output / "manifest.json", manifest)
+    return manifest
+
+
+def policy_artifact_info(artifact: str | Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(artifact, dict):
+        manifest = dict(artifact)
+        root = Path(str(manifest.get("path") or "")).expanduser().resolve()
+    else:
+        value = Path(str(artifact or "").strip()).expanduser().resolve()
+        manifest_path = value / "manifest.json" if value.is_dir() else value
+        if not manifest_path.is_file():
+            raise ValueError(f"policy manifest does not exist: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        root = manifest_path.parent
+    if manifest.get("kind") != "blacknode.policy-artifact" or int(manifest.get("schema_version") or 0) != 1:
+        raise ValueError("unsupported policy artifact manifest")
+    if manifest.get("policy_type") != "act" or manifest.get("backend") != "blacknode-native":
+        raise ValueError("this runtime supports Blacknode-native ACT artifacts")
+    model_path = root / str(manifest.get("model_file") or "")
+    if not model_path.is_file():
+        raise ValueError(f"policy model does not exist: {model_path}")
+    return {**manifest, "path": str(root), "model_path": str(model_path)}
+
+
+class ACTPolicy:
+    """Loaded prediction-only ACT artifact used by deployment adapters."""
+
+    def __init__(self, artifact: str | Path | dict[str, Any], device_name: str = "auto") -> None:
+        data.require_dependencies(needs_torch=True)
+        assert torch is not None and np is not None
+        self.info = policy_artifact_info(artifact)
+        self.device = _device(device_name)
+        model_payload = _torch_load(Path(self.info["model_path"]), self.device)
+        if model_payload.get("kind") != "blacknode.act-policy-model":
+            raise ValueError("artifact model is not a Blacknode ACT policy model")
+        config = ActionChunkingConfig.from_dict(model_payload["model_config"])
+        self.model = ActionChunkingTransformer(config).to(self.device)
+        self.model.load_state_dict(model_payload["model_state"])
+        self.model.eval()
+        self.statistics = dict(self.info["statistics"])
+
+    def predict(self, qpos: list[float], images: dict[str, Any]) -> dict[str, Any]:
+        assert torch is not None and np is not None
+        if len(qpos) != int(self.info["state_dim"]):
+            raise ValueError(f"expected {self.info['state_dim']} joint values, got {len(qpos)}")
+        missing = [name for name in self.info["camera_names"] if name not in images]
+        if missing:
+            raise ValueError("missing policy camera(s): " + ", ".join(missing))
+        qpos_array = np.asarray(qpos, dtype=np.float32)
+        qpos_array = (
+            qpos_array - np.asarray(self.statistics["qpos_mean"], dtype=np.float32)
+        ) / np.asarray(self.statistics["qpos_std"], dtype=np.float32)
+        image_array = np.stack([
+            np.asarray(images[name], dtype=np.float32).transpose(2, 0, 1) / 255.0
+            for name in self.info["camera_names"]
+        ])
+        with torch.no_grad():
+            normalized = self.model(
+                torch.from_numpy(qpos_array).unsqueeze(0).to(self.device),
+                torch.from_numpy(image_array).unsqueeze(0).to(self.device),
+            )[0].cpu().numpy()
+        actions = (
+            normalized * np.asarray(self.statistics["action_std"], dtype=np.float32)
+            + np.asarray(self.statistics["action_mean"], dtype=np.float32)
+        )
+        return {
+            "kind": "blacknode.policy-prediction",
+            "schema_version": 1,
+            "joint_names": list(self.info["joint_names"]),
+            "action": actions[0].astype(float).tolist(),
+            "action_chunk": actions.astype(float).tolist(),
+            "device": str(self.device),
+        }
+
+
+def _policy_dataset_contract(
+    artifact: str | Path | dict[str, Any], dataset_path: str | Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate that a recorded HDF5 dataset can be evaluated by one artifact."""
+    info = policy_artifact_info(artifact)
+    summary = data.inspect_dataset(dataset_path)
+    expected = {
+        "state_dim": int(info["state_dim"]),
+        "action_dim": int(info["action_dim"]),
+        "joint_names": list(info["joint_names"]),
+        "cameras": list(info["camera_names"]),
+    }
+    actual = {
+        "state_dim": int(summary["state_dim"]),
+        "action_dim": int(summary["action_dim"]),
+        "joint_names": list(summary["joint_names"]),
+        "cameras": list(summary["cameras"]),
+    }
+    for key in expected:
+        if actual[key] != expected[key]:
+            raise ValueError(f"dataset {key} does not match policy artifact")
+    return info, summary
+
+
+def check_policy_replay(
+    artifact: str | Path | dict[str, Any], dataset_path: str | Path, episode_index: int,
+) -> dict[str, Any]:
+    """Check policy/dataset compatibility without loading the model or running inference."""
+    info, summary = _policy_dataset_contract(artifact, dataset_path)
+    files = data.episode_files(Path(summary["path"]))
+    if episode_index < 0 or episode_index >= len(files):
+        raise IndexError(f"episode_index must be between 0 and {len(files) - 1}")
+    episode = dict(summary["episodes"][episode_index])
+    return {
+        "artifact": info,
+        "dataset": summary,
+        "episode": episode,
+        "frames": int(episode["frames"]),
+        "fps": int(summary["fps"]),
+    }
+
+
+def replay_policy(
+    artifact: str | Path | dict[str, Any], dataset_path: str | Path, episode_index: int,
+    device_name: str, sync_stream: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate one loaded policy over a recorded episode and build a replay stream.
+
+    The returned stream contains joint-only frames. Camera pixels stay in the
+    recorded dataset and the Dataset Browser remains the visual timeline. When
+    its replay handle is supplied as ``sync_stream``, browser play and seek
+    events drive the predicted trajectory sent to external apps.
+    """
+    data.require_dependencies(needs_torch=True)
+    assert data.h5py is not None and np is not None
+    checked = check_policy_replay(artifact, dataset_path, episode_index)
+    info = checked["artifact"]
+    summary = checked["dataset"]
+    files = data.episode_files(Path(summary["path"]))
+    policy = ACTPolicy(info, device_name)
+    names = list(summary["joint_names"])
+    replay_frames: list[dict[str, Any]] = []
+    errors: list[Any] = []
+    with data.h5py.File(files[episode_index], "r") as handle:
+        qpos_data = handle["observations/qpos"]
+        target_data = handle["action"]
+        timestamps = handle.get("timestamp")
+        leader_data = handle.get("observations/leader")
+        total = int(target_data.shape[0])
+        for frame_index in range(total):
+            qpos = np.asarray(qpos_data[frame_index], dtype=np.float32)
+            target = np.asarray(target_data[frame_index], dtype=np.float32)
+            images = {
+                camera: np.asarray(handle[f"observations/images/{camera}"][frame_index])
+                for camera in summary["cameras"]
+            }
+            prediction = policy.predict(qpos.astype(float).tolist(), images)
+            action = np.asarray(prediction["action"], dtype=np.float32)
+            absolute_error = np.abs(action - target)
+            errors.append(absolute_error)
+            leader = (
+                np.asarray(leader_data[frame_index], dtype=np.float32)
+                if leader_data is not None else qpos
+            )
+            replay_frames.append({
+                "kind": "blacknode.policy-replay-frame",
+                "schema_version": 1,
+                "episode_index": int(episode_index),
+                "frame_index": frame_index,
+                "frames": total,
+                "timestamp": (
+                    float(timestamps[frame_index])
+                    if timestamps is not None else frame_index / float(summary["fps"])
+                ),
+                "joint_names": names,
+                "leader": {name: float(value) for name, value in zip(names, leader)},
+                "observation": {name: float(value) for name, value in zip(names, qpos)},
+                "action": {name: float(value) for name, value in zip(names, action)},
+                "target_action": {name: float(value) for name, value in zip(names, target)},
+                "absolute_error": {name: float(value) for name, value in zip(names, absolute_error)},
+                "action_chunk": prediction["action_chunk"],
+                "policy_step": int(info.get("step") or 0),
+                "motion_commanded": False,
+            })
+    error_array = np.stack(errors)
+    per_joint = error_array.mean(axis=0)
+    metrics = {
+        "kind": "blacknode.policy-replay-metrics",
+        "schema_version": 1,
+        "episode_index": int(episode_index),
+        "frames": len(replay_frames),
+        "mean_absolute_error": float(error_array.mean()),
+        "root_mean_square_error": float(np.sqrt(np.square(error_array).mean())),
+        "max_absolute_error": float(error_array.max()),
+        "per_joint_mean_absolute_error": {
+            name: float(value) for name, value in zip(names, per_joint)
+        },
+        "motion_commanded": False,
+    }
+    sync_handle = dict(sync_stream or {})
+    source_token = (
+        str(sync_handle.get("token") or "")
+        if sync_handle.get("kind") == "blacknode.replay-stream" else ""
+    )
+    stream = {
+        "kind": "blacknode.replay-stream",
+        "schema_version": 1,
+        "label": f"ACT policy · episode {episode_index}",
+        "frames": len(replay_frames),
+        "fps": float(summary["fps"]),
+        "units": str(info.get("units") or "radians"),
+        "joint_names": names,
+        "frames_data": replay_frames,
+        "source_token": source_token,
+        "policy_artifact": str(info["path"]),
+        "policy_step": int(info.get("step") or 0),
+    }
+    return {
+        "kind": "blacknode.policy-replay",
+        "schema_version": 1,
+        "artifact": info,
+        "episode": checked["episode"],
+        "frames": replay_frames,
+        "stream": stream,
+        "metrics": metrics,
+        "motion_commanded": False,
     }
 
 

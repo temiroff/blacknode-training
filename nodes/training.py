@@ -189,3 +189,121 @@ def act_policy_preview(ctx: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "prediction": {}, "action": [], "target_action": [], "absolute_error": [], "action_chunk": [],
                 "report": f"policy preview FAILED: {exc}"}
+
+
+@node(
+    name="ACTPolicyExport", category=_CATEGORY,
+    description="Check or export a trusted ACT checkpoint as an inference-only Blacknode policy artifact.",
+    inputs={
+        "trigger": AnyPort,
+        "action": Enum(["check", "export"], default="check"),
+        "checkpoint_path": Text(default=""),
+        "output_dir": Text(default=""),
+        "overwrite": Bool(default=False),
+    },
+    outputs={"ok": Bool, "exported": Bool, "artifact": Dict, "artifact_path": Text, "report": Text},
+    primary_inputs=["trigger", "checkpoint_path"], primary_outputs=["artifact", "artifact_path", "report"],
+)
+def act_policy_export(ctx: dict) -> dict:
+    try:
+        checkpoint = str(ctx.get("checkpoint_path") or "")
+        info = runtime.checkpoint_info(checkpoint)
+        raw_output = str(ctx.get("output_dir") or "").strip()
+        output = (
+            Path(raw_output).expanduser().resolve()
+            if raw_output
+            else Path(info["path"]).parent / f"policy-{int(info['step']):08d}"
+        )
+        if str(ctx.get("action") or "check").lower() == "check":
+            return {
+                "ok": True, "exported": False, "artifact": {}, "artifact_path": str(output),
+                "report": f"ACT policy export ready at step {info['step']}; choose action=export",
+            }
+        artifact = runtime.export_policy_artifact(
+            checkpoint, output, overwrite=bool(ctx.get("overwrite", False)),
+        )
+        return {
+            "ok": True, "exported": True, "artifact": artifact, "artifact_path": str(artifact["path"]),
+            "report": f"policy artifact exported: {artifact['path']}",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "exported": False, "artifact": {}, "artifact_path": "",
+                "report": f"policy export FAILED: {exc}"}
+
+
+@node(
+    name="PolicyArtifactLoad", category=_CATEGORY,
+    description="Load and validate an exported Blacknode policy artifact manifest without starting inference.",
+    inputs={"trigger": AnyPort, "artifact_path": Text(default="")},
+    outputs={"ok": Bool, "artifact": Dict, "policy_type": Text, "report": Text},
+    primary_inputs=["trigger", "artifact_path"], primary_outputs=["artifact", "report"],
+)
+def policy_artifact_load(ctx: dict) -> dict:
+    try:
+        artifact = runtime.policy_artifact_info(str(ctx.get("artifact_path") or ""))
+        return {
+            "ok": True, "artifact": artifact, "policy_type": str(artifact["policy_type"]),
+            "report": (
+                f"policy artifact ready: {artifact['policy_type']} · "
+                f"{len(artifact['joint_names'])} joint(s) · {len(artifact['camera_names'])} camera(s)"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "artifact": {}, "policy_type": "", "report": f"policy artifact load FAILED: {exc}"}
+
+
+@node(
+    name="ACTPolicyReplay", category=_CATEGORY,
+    description="Check or evaluate a loaded ACT policy across one recorded episode and emit a Dataset Browser-synchronized replay stream with prediction errors. Never commands hardware.",
+    inputs={
+        "trigger": AnyPort,
+        "action": Enum(["check", "evaluate"], default="check"),
+        "artifact": Dict(default={}),
+        "artifact_path": Text(default=""),
+        "dataset_path": Text(default=""),
+        "episode": Dict(default={}),
+        "episode_index": Int(default=0),
+        "device": Enum(["auto", "cuda", "cpu"], default="auto"),
+        "sync_stream": Dict(default={}),
+    },
+    outputs={
+        "ok": Bool, "evaluated": Bool, "replay": Dict, "stream": Dict,
+        "metrics": Dict, "frame_count": Int, "report": Text,
+    },
+    primary_inputs=["trigger", "artifact", "dataset_path"],
+    primary_outputs=["stream", "metrics", "report"],
+)
+def act_policy_replay(ctx: dict) -> dict:
+    try:
+        artifact = dict(ctx.get("artifact") or {}) or str(ctx.get("artifact_path") or "")
+        dataset_path = str(ctx.get("dataset_path") or "")
+        selected_episode = dict(ctx.get("episode") or {})
+        episode_index = int(selected_episode.get("episode_index", ctx.get("episode_index") or 0))
+        checked = runtime.check_policy_replay(artifact, dataset_path, episode_index)
+        if str(ctx.get("action") or "check").lower() == "check":
+            return {
+                "ok": True, "evaluated": False, "replay": {}, "stream": {}, "metrics": {},
+                "frame_count": int(checked["frames"]),
+                "report": (
+                    f"policy replay ready for episode {episode_index} · {checked['frames']} frame(s); "
+                    "choose action=evaluate"
+                ),
+            }
+        result = runtime.replay_policy(
+            artifact, dataset_path, episode_index, str(ctx.get("device") or "auto"),
+            dict(ctx.get("sync_stream") or {}),
+        )
+        metrics = dict(result["metrics"])
+        return {
+            "ok": True, "evaluated": True, "replay": result, "stream": result["stream"],
+            "metrics": metrics, "frame_count": int(metrics["frames"]),
+            "report": (
+                f"policy replay ready: episode {episode_index} · {metrics['frames']} frame(s) · "
+                f"MAE {metrics['mean_absolute_error']:.6f}; robot motion was not commanded"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False, "evaluated": False, "replay": {}, "stream": {}, "metrics": {},
+            "frame_count": 0, "report": f"policy replay FAILED: {exc}",
+        }
