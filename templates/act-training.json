@@ -9,7 +9,7 @@
   },
   "metadata": {
     "template": true,
-    "description": "Browse a Blacknode episode dataset, validate it, prepare its ACT HDF5 training view, train and export a policy, then load, replay, score, and stream its recorded-episode predictions to evaluation apps. Expensive actions start in check/status mode and never command robot motion.",
+    "description": "Browse a Blacknode episode dataset, validate and export its ACT HDF5 training view, start or resume training with live progress and stop controls, then export, replay, score, and stream the policy to evaluation apps. This workflow never commands robot motion.",
     "color": "#f97316",
     "required_packages": [
       "blacknode-training",
@@ -35,13 +35,15 @@
     },
     "hdf5_export": {
       "id": "hdf5_export", "type": "HDF5EpisodeExport", "pos": [780, 160],
-      "params": {"action": "check", "dataset": {}, "output_path": "", "include_images": true, "compression": "gzip", "smoothing": "none", "smoothing_strength": 1.0},
-      "inputs": ["trigger", "action", "dataset", "output_path", "include_images", "compression", "smoothing", "smoothing_strength"],
-      "outputs": ["ok", "exported", "export", "path", "report"],
-      "input_types": {"trigger": "Any", "action": "Text", "dataset": "Dict", "output_path": "Text", "include_images": "Bool", "compression": "Text", "smoothing": "Text", "smoothing_strength": "Float"},
-      "output_types": {"ok": "Bool", "exported": "Bool", "export": "Dict", "path": "Text", "report": "Text"},
-      "input_defaults": {"action": "check", "dataset": {}, "output_path": "", "include_images": true, "compression": "gzip", "smoothing": "none", "smoothing_strength": 1.0},
-      "input_choices": {"action": ["check", "export"], "compression": ["gzip", "lzf", "none"], "smoothing": ["none", "spline", "gaussian", "savgol", "moving_average"]}
+      "params": {"action": "export", "dataset": {}, "output_path": "", "include_images": true, "compression": "gzip", "smoothing": "none", "smoothing_strength": 1.0, "overwrite": false},
+      "inputs": ["trigger", "action", "dataset", "output_path", "include_images", "compression", "smoothing", "smoothing_strength", "overwrite"],
+      "outputs": ["ok", "exported", "status", "export", "path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "dataset": "Dict", "output_path": "Text", "include_images": "Bool", "compression": "Text", "smoothing": "Text", "smoothing_strength": "Float", "overwrite": "Bool"},
+      "output_types": {"ok": "Bool", "exported": "Bool", "status": "Text", "export": "Dict", "path": "Text", "report": "Text"},
+      "input_defaults": {"action": "export", "dataset": {}, "output_path": "", "include_images": true, "compression": "gzip", "smoothing": "none", "smoothing_strength": 1.0, "overwrite": false},
+      "input_choices": {"action": ["export", "check"], "compression": ["gzip", "lzf", "none"], "smoothing": ["none", "spline", "gaussian", "savgol", "moving_average"]},
+      "promoted_inputs": ["action", "dataset", "output_path", "overwrite"],
+      "promoted_outputs": ["exported", "status", "path", "report"]
     },
     "dataset_check": {
       "id": "dataset_check",
@@ -59,7 +61,7 @@
       "type": "ACTTraining",
       "pos": [1510, 100],
       "params": {
-        "action": "status",
+        "action": "start",
         "run_id": "act-training",
         "dataset_path": "",
         "output_dir": "",
@@ -77,13 +79,14 @@
         "eval_every": 250,
         "checkpoint_every": 1000,
         "seed": 42,
-        "resume": false
+        "resume": true,
+        "overwrite": false
       },
       "inputs": [
         "trigger", "action", "run_id", "dataset_path", "output_dir", "device",
         "steps", "batch_size", "learning_rate", "weight_decay", "chunk_size",
         "hidden_dim", "attention_heads", "encoder_layers", "decoder_layers",
-        "validation_fraction", "eval_every", "checkpoint_every", "seed", "resume"
+        "validation_fraction", "eval_every", "checkpoint_every", "seed", "resume", "overwrite"
       ],
       "outputs": ["ok", "running", "phase", "step", "status", "dashboard", "checkpoint", "report"],
       "input_types": {
@@ -91,23 +94,25 @@
         "device": "Text", "steps": "Int", "batch_size": "Int", "learning_rate": "Float", "weight_decay": "Float",
         "chunk_size": "Int", "hidden_dim": "Int", "attention_heads": "Int", "encoder_layers": "Int",
         "decoder_layers": "Int", "validation_fraction": "Float", "eval_every": "Int", "checkpoint_every": "Int",
-        "seed": "Int", "resume": "Bool"
+        "seed": "Int", "resume": "Bool", "overwrite": "Bool"
       },
       "output_types": {
         "ok": "Bool", "running": "Bool", "phase": "Text", "step": "Int", "status": "Dict",
         "dashboard": "Image", "checkpoint": "Text", "report": "Text"
       },
       "input_defaults": {
-        "action": "status", "run_id": "act-training", "dataset_path": "", "output_dir": "", "device": "auto",
+        "action": "start", "run_id": "act-training", "dataset_path": "", "output_dir": "", "device": "auto",
         "steps": 5000, "batch_size": 8, "learning_rate": 0.0001, "weight_decay": 0.0001,
         "chunk_size": 32, "hidden_dim": 256, "attention_heads": 8, "encoder_layers": 4,
         "decoder_layers": 2, "validation_fraction": 0.1, "eval_every": 250,
-        "checkpoint_every": 1000, "seed": 42, "resume": false
+        "checkpoint_every": 1000, "seed": 42, "resume": true, "overwrite": false
       },
       "input_choices": {
-        "action": ["status", "check", "start", "stop"],
+        "action": ["start", "status", "check", "stop"],
         "device": ["auto", "cuda", "cpu"]
-      }
+      },
+      "promoted_inputs": ["action", "dataset_path", "output_dir", "overwrite"],
+      "promoted_outputs": ["running", "phase", "step", "dashboard", "checkpoint", "report"]
     },
     "checkpoint": {
       "id": "checkpoint", "type": "ACTCheckpointInspect", "pos": [1930, 80],
@@ -129,13 +134,15 @@
     },
     "export": {
       "id": "export", "type": "ACTPolicyExport", "pos": [1930, 610],
-      "params": {"action": "check", "checkpoint_path": "", "output_dir": "", "overwrite": false},
+      "params": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": false},
       "inputs": ["trigger", "action", "checkpoint_path", "output_dir", "overwrite"],
-      "outputs": ["ok", "exported", "artifact", "artifact_path", "report"],
+      "outputs": ["ok", "exported", "status", "artifact", "artifact_path", "report"],
       "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "output_dir": "Text", "overwrite": "Bool"},
-      "output_types": {"ok": "Bool", "exported": "Bool", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
-      "input_defaults": {"action": "check", "checkpoint_path": "", "output_dir": "", "overwrite": false},
-      "input_choices": {"action": ["check", "export"]}
+      "output_types": {"ok": "Bool", "exported": "Bool", "status": "Text", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": false},
+      "input_choices": {"action": ["export", "check"]},
+      "promoted_inputs": ["action", "checkpoint_path", "output_dir", "overwrite"],
+      "promoted_outputs": ["exported", "status", "artifact_path", "report"]
     },
     "policy_load": {
       "id": "policy_load", "type": "PolicyArtifactLoad", "pos": [2310, 610],
@@ -147,23 +154,25 @@
     },
     "policy_replay": {
       "id": "policy_replay", "type": "ACTPolicyReplay", "pos": [2690, 430],
-      "params": {"action": "check", "artifact": {}, "artifact_path": "", "dataset_path": "", "episode": {}, "episode_index": 0, "device": "auto", "sync_stream": {}},
+      "params": {"action": "evaluate", "artifact": {}, "artifact_path": "", "dataset_path": "", "episode": {}, "episode_index": 0, "device": "auto", "sync_stream": {}},
       "inputs": ["trigger", "action", "artifact", "artifact_path", "dataset_path", "episode", "episode_index", "device", "sync_stream"],
       "outputs": ["ok", "evaluated", "replay", "stream", "metrics", "frame_count", "report"],
       "input_types": {"trigger": "Any", "action": "Text", "artifact": "Dict", "artifact_path": "Text", "dataset_path": "Text", "episode": "Dict", "episode_index": "Int", "device": "Text", "sync_stream": "Dict"},
       "output_types": {"ok": "Bool", "evaluated": "Bool", "replay": "Dict", "stream": "Dict", "metrics": "Dict", "frame_count": "Int", "report": "Text"},
-      "input_defaults": {"action": "check", "artifact": {}, "artifact_path": "", "dataset_path": "", "episode": {}, "episode_index": 0, "device": "auto", "sync_stream": {}},
-      "input_choices": {"action": ["check", "evaluate"], "device": ["auto", "cuda", "cpu"]}
+      "input_defaults": {"action": "evaluate", "artifact": {}, "artifact_path": "", "dataset_path": "", "episode": {}, "episode_index": 0, "device": "auto", "sync_stream": {}},
+      "input_choices": {"action": ["evaluate", "check"], "device": ["auto", "cuda", "cpu"]},
+      "promoted_inputs": ["action", "artifact", "dataset_path", "episode_index"],
+      "promoted_outputs": ["evaluated", "stream", "metrics", "report"]
     },
     "policy_stream": {
       "id": "policy_stream", "type": "StreamPublisher", "pos": [3090, 430],
-      "params": {"action": "status", "run_id": "act-policy-replay", "stream": {}, "host": "127.0.0.1", "port": 8766, "source": "action", "units": "radians", "fps": 0.0, "rate": 1.0, "loop": true, "sync_to_browser": true},
+      "params": {"action": "start", "run_id": "act-policy-replay", "stream": {}, "host": "127.0.0.1", "port": 8766, "source": "action", "units": "radians", "fps": 0.0, "rate": 1.0, "loop": true, "sync_to_browser": true},
       "inputs": ["trigger", "action", "run_id", "stream", "host", "port", "source", "units", "fps", "rate", "loop", "sync_to_browser"],
       "outputs": ["stream_url", "streaming", "clients", "status", "dashboard", "report"],
       "input_types": {"trigger": "Any", "action": "Text", "run_id": "Text", "stream": "Dict", "host": "Text", "port": "Int", "source": "Text", "units": "Text", "fps": "Float", "rate": "Float", "loop": "Bool", "sync_to_browser": "Bool"},
       "output_types": {"stream_url": "Text", "streaming": "Bool", "clients": "Int", "status": "Dict", "dashboard": "Image", "report": "Text"},
-      "input_defaults": {"action": "status", "run_id": "act-policy-replay", "stream": {}, "host": "127.0.0.1", "port": 8766, "source": "action", "units": "radians", "fps": 0.0, "rate": 1.0, "loop": true, "sync_to_browser": true},
-      "input_choices": {"action": ["status", "start", "stop"], "source": ["action", "observation", "leader"], "units": ["radians", "degrees"]}
+      "input_defaults": {"action": "start", "run_id": "act-policy-replay", "stream": {}, "host": "127.0.0.1", "port": 8766, "source": "action", "units": "radians", "fps": 0.0, "rate": 1.0, "loop": true, "sync_to_browser": true},
+      "input_choices": {"action": ["start", "status", "stop"], "source": ["action", "observation", "leader"], "units": ["radians", "degrees"]}
     }
   },
   "edges": [

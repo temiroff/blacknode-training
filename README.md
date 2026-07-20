@@ -24,33 +24,28 @@ focused on acquisition.
 1. Record successful episodes with `blacknode-dataset`.
 2. Open **Blacknode Native ACT Training**.
 3. Use `DatasetBrowser` to choose the dataset root and dataset ID.
-4. Inspect the selected episode and camera, then run `EpisodeDatasetValidate`.
-5. Set `HDF5EpisodeExport.action=export` with `include_images=true` and cook it
-   once. Return the action to `check` after the export is ready.
-6. Confirm `TrainingDatasetCheck` reports the expected episodes, joints, and
-   cameras.
-7. Set `ACTTraining.action=check` and cook the dashboard.
-8. Choose `action=start` only after the dataset and output settings are valid.
-9. Return the action to `status` to monitor the current job.
-10. Use `action=stop` for a cooperative stop; the latest completed step is
-   checkpointed and can be resumed with `resume=true`.
-11. Export the checkpoint, load it with `PolicyArtifactLoad`, and set
-    `ACTPolicyReplay.action=evaluate` for the selected Dataset Browser episode.
-12. Start the connected `StreamPublisher`. Playing or seeking the Dataset
-    Browser sends policy-predicted actions to the external evaluation apps.
+4. Press **Start / resume** on `ACTTraining`. Its upstream HDF5 exporter creates
+   the training view automatically or reuses a valid existing export.
+5. Watch the live phase, step counter, progress bar, losses, and dashboard. The
+   node refreshes every second; press **Stop** for a cooperative checkpointed
+   stop.
+6. Cook `ACTPolicyExport` after a checkpoint is available. It exports by
+   default and reuses an existing valid artifact unless `overwrite` is enabled.
+7. Cook `ACTPolicyReplay` to evaluate the selected episode, then cook the
+   connected `StreamPublisher` to stream predictions to evaluation apps.
 
 The browser selects the Blacknode-native dataset. The HDF5 export node produces
 the ACT training view and passes its path directly into dataset checking,
-training, and policy preview. The export defaults to `check`, and training
-defaults to `status`, so cooking the graph never implicitly exports data or
-starts training.
+training, and policy preview. Local operation nodes default to what their names
+promise: export, start/resume, evaluate, and stream. Diagnostic `check` and
+`status` actions remain available when needed.
 
 ## Nodes
 
 | Node | Purpose |
 | --- | --- |
 | `TrainingDatasetCheck` | Validate episode files, state/action dimensions, joint order, cameras, FPS, frame counts, and finite numeric data. |
-| `ACTTraining` | Check, start, monitor, stop, or resume one managed background training run. Its dashboard shows phase, progress, train loss, validation loss, and failures. |
+| `ACTTraining` | Start, visibly monitor, stop, or automatically resume one managed background training run. Its dashboard shows phase, progress, train loss, validation loss, and failures. |
 | `ACTCheckpointInspect` | Read the fixed schema, normalization statistics, split, model configuration, step, and metrics from a checkpoint. |
 | `ACTPolicyPreview` | Predict and display a denormalized future action chunk for one recorded frame. |
 | `ACTPolicyExport` | Export model weights, schema, normalization, camera order, joint order, and metrics as an inference-only policy artifact. |

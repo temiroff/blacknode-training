@@ -57,6 +57,10 @@ def test_nodes_registered_and_motion_free():
         assert definition._bn_category == "Training"
     assert not any("robot" in output.lower() or "command" in output.lower() for output in _NODE_REGISTRY["ACTPolicyPreview"]._bn_outputs)
     assert not any("robot" in output.lower() or "command" in output.lower() for output in _NODE_REGISTRY["ACTPolicyReplay"]._bn_outputs)
+    assert _NODE_REGISTRY["ACTTraining"]._bn_input_defaults["action"] == "start"
+    assert _NODE_REGISTRY["ACTTraining"]._bn_input_defaults["resume"] is True
+    assert _NODE_REGISTRY["ACTPolicyExport"]._bn_input_defaults["action"] == "export"
+    assert _NODE_REGISTRY["ACTPolicyReplay"]._bn_input_defaults["action"] == "evaluate"
 
 
 def test_status_is_non_mutating_and_dashboard_is_svg():
@@ -67,7 +71,18 @@ def test_status_is_non_mutating_and_dashboard_is_svg():
     prefix = "data:image/svg+xml;base64,"
     assert result["dashboard"].startswith(prefix)
     svg = base64.b64decode(result["dashboard"][len(prefix):]).decode("utf-8")
-    assert "never commands robot motion" in svg
+    assert "hardware motion remains disarmed" in svg
+    controlled = runtime.control_training_job("never-started", "status")
+    assert controlled["phase"] == "not_started"
+    assert controlled["dashboard"].startswith(prefix)
+
+
+def test_dashboard_wraps_long_errors_without_truncating_text():
+    message = "A detailed training failure explains the output directory and recovery action. " * 4 + "TAIL_MARKER"
+    encoded = runtime.dashboard({"phase": "failed", "step": 0, "steps": 100, "error": message})
+    svg = base64.b64decode(encoded.split(",", 1)[1]).decode("utf-8")
+    assert "TAIL_MARKER" in svg
+    assert 'height="210"' not in svg
 
 
 def test_missing_dataset_is_structured_error(tmp_path: Path):
@@ -98,11 +113,12 @@ def test_template_validates():
     workflow = json.loads(path.read_text(encoding="utf-8"))
     assert validate_workflow(workflow).ok
     assert workflow["entrypoint"] == {"node_id": "training", "port": "dashboard"}
-    assert workflow["node_meta"]["training"]["params"]["action"] == "status"
-    assert workflow["node_meta"]["hdf5_export"]["params"]["action"] == "check"
+    assert workflow["node_meta"]["training"]["params"]["action"] == "start"
+    assert workflow["node_meta"]["training"]["params"]["resume"] is True
+    assert workflow["node_meta"]["hdf5_export"]["params"]["action"] == "export"
     assert workflow["node_meta"]["dataset_browser"]["type"] == "DatasetBrowser"
-    assert workflow["node_meta"]["policy_replay"]["params"]["action"] == "check"
-    assert workflow["node_meta"]["policy_stream"]["params"]["action"] == "status"
+    assert workflow["node_meta"]["policy_replay"]["params"]["action"] == "evaluate"
+    assert workflow["node_meta"]["policy_stream"]["params"]["action"] == "start"
     assert {"blacknode-training", "blacknode-dataset"} <= set(workflow["metadata"]["required_packages"])
     assert {
         (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
@@ -176,6 +192,14 @@ def test_dataset_training_checkpoint_and_preview(tmp_path: Path):
     assert status["phase"] == "completed", status
     checkpoint = Path(status["checkpoint"])
     assert checkpoint.exists()
+    rerun = _NODE_REGISTRY["ACTTraining"]({
+        "run_id": "synthetic", "dataset_path": str(tmp_path), "output_dir": str(output),
+        "device": "cpu", "steps": 2, "batch_size": 2, "chunk_size": 3,
+        "hidden_dim": 32, "attention_heads": 4, "encoder_layers": 1, "decoder_layers": 1,
+    })
+    assert rerun["ok"] and not rerun["running"]
+    assert rerun["phase"] == "completed"
+    assert rerun["step"] == 2
     info = runtime.checkpoint_info(checkpoint)
     assert info["step"] == 2
     prediction = runtime.preview(checkpoint, tmp_path, 0, 0, "cpu")

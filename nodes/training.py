@@ -1,7 +1,10 @@
 """Blacknode nodes for native offline action-chunking policy training."""
 from __future__ import annotations
 
+import json
 import re
+import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +46,7 @@ def _config(ctx: dict[str, Any]) -> runtime.TrainingConfig:
         eval_every=max(1, int(ctx.get("eval_every") or 250)),
         checkpoint_every=max(1, int(ctx.get("checkpoint_every") or 1000)),
         seed=int(ctx.get("seed") or 42),
-        resume=bool(ctx.get("resume", False)),
+        resume=bool(ctx.get("resume", True)),
     )
     if config.hidden_dim % config.attention_heads:
         raise ValueError("hidden_dim must be divisible by attention_heads")
@@ -77,10 +80,10 @@ def training_dataset_check(ctx: dict) -> dict:
 
 @node(
     name="ACTTraining", live=True, category=_CATEGORY,
-    description="Check, start, monitor, resume, or stop a managed Blacknode-native action-chunking training job.",
+    description="Start or continue a managed Blacknode-native action-chunking training job. Active, completed, and checkpointed runs are reused automatically.",
     inputs={
         "trigger": AnyPort,
-        "action": Enum(["status", "check", "start", "stop"], default="status"),
+        "action": Enum(["start", "status", "check", "stop"], default="start"),
         "run_id": Text(default="act-training"), "dataset_path": Text(default=""), "output_dir": Text(default=""),
         "device": Enum(["auto", "cuda", "cpu"], default="auto"),
         "steps": Int(default=5000), "batch_size": Int(default=8),
@@ -88,16 +91,18 @@ def training_dataset_check(ctx: dict) -> dict:
         "chunk_size": Int(default=32), "hidden_dim": Int(default=256),
         "attention_heads": Int(default=8), "encoder_layers": Int(default=4), "decoder_layers": Int(default=2),
         "validation_fraction": Float(default=0.1), "eval_every": Int(default=250),
-        "checkpoint_every": Int(default=1000), "seed": Int(default=42), "resume": Bool(default=False),
+        "checkpoint_every": Int(default=1000), "seed": Int(default=42), "resume": Bool(default=True),
+        "overwrite": Bool(default=False),
     },
     outputs={
         "ok": Bool, "running": Bool, "phase": Text, "step": Int,
         "status": Dict, "dashboard": Image, "checkpoint": Text, "report": Text,
     },
-    primary_inputs=["trigger"], primary_outputs=["dashboard", "checkpoint", "report"],
+    primary_inputs=["trigger", "action", "dataset_path", "output_dir", "overwrite"],
+    primary_outputs=["dashboard", "checkpoint", "report"],
 )
 def act_training(ctx: dict) -> dict:
-    action = str(ctx.get("action") or "status").lower()
+    action = str(ctx.get("action") or "start").lower()
     try:
         run_id = _run_id(ctx.get("run_id") or "act-training")
         if action == "status":
@@ -108,10 +113,6 @@ def act_training(ctx: dict) -> dict:
             config = _config(ctx)
             summary = data.inspect_dataset(config.dataset_path)
             output = Path(config.output_dir)
-            if output.exists() and not config.resume:
-                raise FileExistsError(f"output_dir already exists: {output}; choose another path or enable resume")
-            if config.resume and not sorted(output.glob("checkpoint-*.pt")):
-                raise ValueError(f"resume requested but no checkpoints exist in {output}")
             if action == "check":
                 status = {
                     **runtime.job_status(run_id),
@@ -119,7 +120,42 @@ def act_training(ctx: dict) -> dict:
                     "steps": config.steps, "device": config.device,
                 }
             elif action == "start":
-                status = runtime.start_job(config)
+                current = runtime.job_status(run_id)
+                if bool(current.get("running")):
+                    status = current
+                else:
+                    checkpoints = sorted(output.glob("checkpoint-*.pt")) if output.exists() else []
+                    if output.exists() and bool(ctx.get("overwrite", False)):
+                        shutil.rmtree(output)
+                        checkpoints = []
+                        config = replace(config, resume=False)
+                    elif checkpoints:
+                        latest = runtime.checkpoint_info(checkpoints[-1])
+                        latest_step = int(latest.get("step") or 0)
+                        if latest_step >= config.steps:
+                            status = {
+                                **current,
+                                "phase": "completed", "running": False,
+                                "step": latest_step, "steps": config.steps, "progress": 1.0,
+                                "checkpoint": str(checkpoints[-1]), "output_dir": str(output),
+                                "error": "",
+                            }
+                        else:
+                            config = replace(config, resume=True)
+                            status = runtime.start_job(config)
+                    else:
+                        if output.exists() and any(output.iterdir()):
+                            run_path = output / "run.json"
+                            try:
+                                prior_run = json.loads(run_path.read_text(encoding="utf-8")) if run_path.is_file() else {}
+                            except Exception:  # noqa: BLE001
+                                prior_run = {}
+                            if prior_run.get("kind") != "blacknode.training-run":
+                                raise FileExistsError(
+                                    f"output_dir contains unrelated data: {output}; enable overwrite to restart"
+                                )
+                        config = replace(config, resume=False)
+                        status = runtime.start_job(config)
             else:
                 raise ValueError("action must be status, check, start, or stop")
         phase = str(status.get("phase") or "unknown")
@@ -193,16 +229,17 @@ def act_policy_preview(ctx: dict) -> dict:
 
 @node(
     name="ACTPolicyExport", category=_CATEGORY,
-    description="Check or export a trusted ACT checkpoint as an inference-only Blacknode policy artifact.",
+    description="Export a trusted ACT checkpoint as an inference-only Blacknode policy artifact. Existing valid artifacts are reused unless overwrite is enabled.",
     inputs={
         "trigger": AnyPort,
-        "action": Enum(["check", "export"], default="check"),
+        "action": Enum(["export", "check"], default="export"),
         "checkpoint_path": Text(default=""),
         "output_dir": Text(default=""),
         "overwrite": Bool(default=False),
     },
-    outputs={"ok": Bool, "exported": Bool, "artifact": Dict, "artifact_path": Text, "report": Text},
-    primary_inputs=["trigger", "checkpoint_path"], primary_outputs=["artifact", "artifact_path", "report"],
+    outputs={"ok": Bool, "exported": Bool, "status": Text, "artifact": Dict, "artifact_path": Text, "report": Text},
+    primary_inputs=["trigger", "action", "checkpoint_path", "output_dir", "overwrite"],
+    primary_outputs=["exported", "status", "artifact_path", "report"],
 )
 def act_policy_export(ctx: dict) -> dict:
     try:
@@ -214,20 +251,37 @@ def act_policy_export(ctx: dict) -> dict:
             if raw_output
             else Path(info["path"]).parent / f"policy-{int(info['step']):08d}"
         )
-        if str(ctx.get("action") or "check").lower() == "check":
+        action = str(ctx.get("action") or "export").lower()
+        if action == "check":
             return {
-                "ok": True, "exported": False, "artifact": {}, "artifact_path": str(output),
+                "ok": True, "exported": False, "status": "checked_not_exported",
+                "artifact": {}, "artifact_path": str(output),
                 "report": f"ACT policy export ready at step {info['step']}; choose action=export",
+            }
+        if action != "export":
+            raise ValueError(f"unsupported action: {action}; choose export or check")
+        if output.exists() and not bool(ctx.get("overwrite", False)):
+            try:
+                artifact = runtime.policy_artifact_info(output)
+            except Exception as exc:  # noqa: BLE001
+                raise FileExistsError(
+                    f"output directory exists but is not a valid policy artifact: {output}; enable overwrite to replace it"
+                ) from exc
+            return {
+                "ok": True, "exported": True, "status": "exists", "artifact": artifact,
+                "artifact_path": str(output),
+                "report": f"EXISTS — valid policy artifact left unchanged. Enable overwrite to rebuild: {output}",
             }
         artifact = runtime.export_policy_artifact(
             checkpoint, output, overwrite=bool(ctx.get("overwrite", False)),
         )
         return {
-            "ok": True, "exported": True, "artifact": artifact, "artifact_path": str(artifact["path"]),
+            "ok": True, "exported": True, "status": "exported",
+            "artifact": artifact, "artifact_path": str(artifact["path"]),
             "report": f"policy artifact exported: {artifact['path']}",
         }
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "exported": False, "artifact": {}, "artifact_path": "",
+        return {"ok": False, "exported": False, "status": "failed", "artifact": {}, "artifact_path": "",
                 "report": f"policy export FAILED: {exc}"}
 
 
@@ -254,10 +308,10 @@ def policy_artifact_load(ctx: dict) -> dict:
 
 @node(
     name="ACTPolicyReplay", category=_CATEGORY,
-    description="Check or evaluate a loaded ACT policy across one recorded episode and emit a Dataset Browser-synchronized replay stream with prediction errors. Never commands hardware.",
+    description="Evaluate a loaded ACT policy across one recorded episode and emit a Dataset Browser-synchronized replay stream with prediction errors. Never commands hardware.",
     inputs={
         "trigger": AnyPort,
-        "action": Enum(["check", "evaluate"], default="check"),
+        "action": Enum(["evaluate", "check"], default="evaluate"),
         "artifact": Dict(default={}),
         "artifact_path": Text(default=""),
         "dataset_path": Text(default=""),
@@ -270,7 +324,7 @@ def policy_artifact_load(ctx: dict) -> dict:
         "ok": Bool, "evaluated": Bool, "replay": Dict, "stream": Dict,
         "metrics": Dict, "frame_count": Int, "report": Text,
     },
-    primary_inputs=["trigger", "artifact", "dataset_path"],
+    primary_inputs=["trigger", "action", "artifact", "dataset_path"],
     primary_outputs=["stream", "metrics", "report"],
 )
 def act_policy_replay(ctx: dict) -> dict:
@@ -280,7 +334,7 @@ def act_policy_replay(ctx: dict) -> dict:
         selected_episode = dict(ctx.get("episode") or {})
         episode_index = int(selected_episode.get("episode_index", ctx.get("episode_index") or 0))
         checked = runtime.check_policy_replay(artifact, dataset_path, episode_index)
-        if str(ctx.get("action") or "check").lower() == "check":
+        if str(ctx.get("action") or "evaluate").lower() == "check":
             return {
                 "ok": True, "evaluated": False, "replay": {}, "stream": {}, "metrics": {},
                 "frame_count": int(checked["frames"]),

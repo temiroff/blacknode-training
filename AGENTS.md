@@ -13,8 +13,9 @@ discovery, ROS transport, or robot motion.
 
 - Keep PyTorch and HDF5 imports guarded so package discovery works before
   optional dependencies are installed.
-- Training actions default to `check` or `status`; a graph cook must not start
-  an expensive job implicitly.
+- Dedicated training workflows default to their named local operation. Opening
+  a graph is passive; pressing Run starts or resumes the managed job and shows
+  live progress with an explicit stop control.
 - Training runs in a managed background job with explicit stop and resume.
 - Write checkpoints atomically and include dataset schema, normalization
   statistics, model configuration, joint names, and camera names.

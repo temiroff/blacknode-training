@@ -6,6 +6,7 @@ import base64
 import html
 import json
 import math
+import textwrap
 import threading
 import time
 from collections import deque
@@ -115,12 +116,13 @@ class TrainingJob:
     def status(self) -> dict[str, Any]:
         with self.lock:
             elapsed = max(0.0, ((self.ended_ns or time.time_ns()) - self.started_ns) / 1e9)
+            running = self.thread.is_alive()
             return {
                 "kind": "blacknode.training-job",
                 "schema_version": 1,
                 "run_id": self.config.run_id,
-                "phase": self.phase,
-                "running": self.thread.is_alive(),
+                "phase": "stopping" if running and self.stop_event.is_set() else self.phase,
+                "running": running,
                 "stop_requested": self.stop_event.is_set(),
                 "step": self.step,
                 "steps": self.config.steps,
@@ -252,8 +254,17 @@ class TrainingJob:
                 model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay
             )
             output = Path(self.config.output_dir).expanduser().resolve()
-            if output.exists() and not self.config.resume:
-                raise FileExistsError(f"output_dir already exists: {output}; choose another path or enable resume")
+            if output.exists() and not self.config.resume and any(output.iterdir()):
+                run_path = output / "run.json"
+                try:
+                    prior_run = json.loads(run_path.read_text(encoding="utf-8")) if run_path.is_file() else {}
+                except Exception:  # noqa: BLE001
+                    prior_run = {}
+                reusable = prior_run.get("kind") == "blacknode.training-run" and not any(output.glob("checkpoint-*.pt"))
+                if not reusable:
+                    raise FileExistsError(
+                        f"output_dir already contains data: {output}; enable overwrite to restart or use its checkpoints"
+                    )
             output.mkdir(parents=True, exist_ok=True)
             run_manifest = {
                 "kind": "blacknode.training-run", "schema_version": 1,
@@ -387,6 +398,31 @@ def job_status(run_id: str) -> dict[str, Any]:
             "device": "", "error": "", "logs": [],
         }
     return job.status()
+
+
+def control_training_job(run_id: str, action: str) -> dict[str, Any]:
+    """Return editor-ready live outputs for status/stop controls."""
+    normalized = str(action or "status").lower()
+    if normalized == "status":
+        status = job_status(run_id)
+    elif normalized == "stop":
+        status = stop_job(run_id)
+    else:
+        raise ValueError("ACTTraining direct control supports status or stop")
+    phase = str(status.get("phase") or "unknown")
+    return {
+        "ok": phase != "failed",
+        "running": bool(status.get("running")),
+        "phase": phase,
+        "step": int(status.get("step") or 0),
+        "status": status,
+        "dashboard": dashboard(status),
+        "checkpoint": str(status.get("checkpoint") or ""),
+        "report": (
+            f"training {phase}: step {int(status.get('step') or 0)}/{int(status.get('steps') or 0)}"
+            + (f"; {status['error']}" if status.get("error") else "")
+        ),
+    }
 
 
 def runtime_status() -> dict[str, Any]:
@@ -767,21 +803,26 @@ def dashboard(status: dict[str, Any]) -> str:
     progress = max(0.0, min(1.0, float(status.get("progress") or 0.0)))
     train_loss = status.get("train_loss")
     validation_loss = status.get("validation_loss")
-    error = html.escape(str(status.get("error") or ""))
+    error_lines = textwrap.wrap(str(status.get("error") or ""), width=72, break_long_words=True) or [""]
     color = "#22c55e" if phase == "COMPLETED" else "#ef4444" if phase == "FAILED" else "#f97316"
     width = 520
+    height = 210 + max(0, len(error_lines) - 1) * 18
     fill = int(472 * progress)
     def metric(value: Any) -> str:
         return "—" if value is None else f"{float(value):.5f}"
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="220" viewBox="0 0 {width} 220">
+    error_svg = "".join(
+        f'<text x="24" y="{194 + index * 18}" fill="#fca5a5" font-family="sans-serif" font-size="12">{html.escape(line)}</text>'
+        for index, line in enumerate(error_lines)
+    )
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
 <rect width="100%" height="100%" rx="18" fill="#111827"/>
 <circle cx="30" cy="34" r="7" fill="{color}"/><text x="48" y="40" fill="#f9fafb" font-family="sans-serif" font-size="19" font-weight="700">ACT TRAINING · {phase}</text>
 <text x="24" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">STEP</text><text x="24" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{step} / {steps}</text>
 <text x="250" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">TRAIN LOSS</text><text x="250" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{metric(train_loss)}</text>
 <text x="390" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">VAL LOSS</text><text x="390" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{metric(validation_loss)}</text>
 <rect x="24" y="122" width="472" height="14" rx="7" fill="#374151"/><rect x="24" y="122" width="{fill}" height="14" rx="7" fill="{color}"/>
-<text x="24" y="166" fill="#d1d5db" font-family="sans-serif" font-size="13">Prediction-only training package · never commands robot motion</text>
-<text x="24" y="194" fill="#fca5a5" font-family="sans-serif" font-size="12">{error[:75]}</text>
+<text x="24" y="166" fill="#d1d5db" font-family="sans-serif" font-size="13">Offline prediction training · hardware motion remains disarmed</text>
+{error_svg}
 </svg>'''
     return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
 
