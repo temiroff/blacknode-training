@@ -1,7 +1,7 @@
 {
   "kind": "blacknode.workflow",
   "schema_version": 1,
-  "name": "Blacknode Native ACT Training",
+  "name": "Native ACT Training",
   "saved_at": "2026-07-16T00:00:00",
   "entrypoint": {
     "node_id": "training",
