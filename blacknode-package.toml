@@ -3,6 +3,7 @@ name = "blacknode-training"
 version = "0.2.0"
 description = "Blacknode-native robot policy training, resumable checkpoints, previews, and policy artifacts."
 requires-blacknode = ">=0.1.0"
+layer = "learning"
 
 [categories]
 "Training" = "#f97316"
@@ -18,25 +19,44 @@ default = true
 capabilities = ["training.dataset-check"]
 
 # Roadmap component; sources land in components/training-jobs/nodes.
+node-types = [
+  "TrainingDatasetCheck"
+]
+
 [components.training-jobs]
 description = "Resumable policy training runs."
 default = true
 capabilities = ["training.jobs"]
 
 # Roadmap component; sources land in components/checkpoints/nodes.
+node-types = [
+  "ACTTraining"
+]
+
 [components.checkpoints]
 description = "Checkpoint inspection and management."
 default = true
 capabilities = ["training.checkpoints"]
 
 # Roadmap component; sources land in components/policy-preview/nodes.
+node-types = [
+  "ACTCheckpointInspect"
+]
+
 [components.policy-preview]
 description = "Policy preview and replay against recorded episodes."
 default = true
 capabilities = ["training.preview"]
 
 # Roadmap component; sources land in components/policy-artifacts/nodes.
+node-types = [
+  "ACTPolicyPreview", "ACTPolicyReplay"
+]
+
 [components.policy-artifacts]
 description = "Policy export and artifact loading."
 default = true
 capabilities = ["training.artifacts"]
+node-types = [
+  "ACTPolicyExport", "PolicyArtifactLoad"
+]
