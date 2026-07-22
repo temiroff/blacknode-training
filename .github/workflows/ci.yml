@@ -1,0 +1,66 @@
+name: Package CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out package
+        uses: actions/checkout@v6
+        with:
+          path: package
+      - name: Check out Blacknode
+        uses: actions/checkout@v6
+        with:
+          repository: temiroff/Blacknode
+          path: core
+      - name: Check out workflow dependencies
+        shell: bash
+        run: |
+          mkdir -p core/packages
+          git clone --depth 1 https://github.com/temiroff/blacknode-dataset.git core/packages/blacknode-dataset
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./core pytest
+          python -m pip install "numpy>=1.24" "h5py>=3.11"
+          # torch is skipped on purpose: the model tests guard the import.
+      - name: Link package into Blacknode
+        shell: bash
+        run: |
+          mkdir -p core/packages
+          ln -s "$GITHUB_WORKSPACE/package" "core/packages/${GITHUB_REPOSITORY#*/}"
+      - name: Run package tests
+        working-directory: package
+        env:
+          PYTHONPATH: ../core/python
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: python -m pytest tests
+      - name: Validate official package catalog
+        working-directory: core
+        env:
+          PYTHONPATH: python
+        run: python -m blacknode.cli packages validate-catalog ../package
+      - name: Validate package templates
+        if: ${{ hashFiles('package/**/templates/*.json') != '' }}
+        working-directory: core
+        env:
+          PYTHONPATH: python
+        shell: bash
+        run: |
+          find ../package -path '*/templates/*.json' -print0 | while IFS= read -r -d '' template; do
+            python -m blacknode.cli validate "$template"
+          done
