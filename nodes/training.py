@@ -56,7 +56,7 @@ def _config(ctx: dict[str, Any]) -> runtime.TrainingConfig:
 
 
 @node(
-    name="TrainingDatasetCheck", category=_CATEGORY,
+    name="TrainingDatasetCheck", component="dataset-check", category=_CATEGORY,
     description="Validate Blacknode ACT-style HDF5 episodes without starting training.",
     inputs={"trigger": AnyPort, "dataset_path": Text(default="")},
     outputs={"ok": Bool, "dataset": Dict, "episode_count": Int, "frame_count": Int, "report": Text},
@@ -79,7 +79,7 @@ def training_dataset_check(ctx: dict) -> dict:
 
 
 @node(
-    name="ACTTraining", live=True, category=_CATEGORY,
+    name="ACTTraining", component="training-jobs", live=True, category=_CATEGORY,
     description="Start or continue a managed Blacknode-native action-chunking training job. Active, completed, and checkpointed runs are reused automatically.",
     inputs={
         "trigger": AnyPort,
@@ -180,7 +180,7 @@ def act_training(ctx: dict) -> dict:
 
 
 @node(
-    name="ACTCheckpointInspect", category=_CATEGORY,
+    name="ACTCheckpointInspect", component="checkpoints", category=_CATEGORY,
     description="Inspect a local Blacknode action-chunking checkpoint and its fixed dataset contract.",
     inputs={"trigger": AnyPort, "checkpoint_path": Text(default="")},
     outputs={"ok": Bool, "checkpoint": Dict, "step": Int, "report": Text},
@@ -196,7 +196,7 @@ def act_checkpoint_inspect(ctx: dict) -> dict:
 
 
 @node(
-    name="ACTPolicyPreview", category=_CATEGORY,
+    name="ACTPolicyPreview", component="policy-preview", category=_CATEGORY,
     description="Predict an action chunk for one recorded frame without connecting to or commanding robot hardware.",
     inputs={
         "trigger": AnyPort, "checkpoint_path": Text(default=""), "dataset_path": Text(default=""),
@@ -228,7 +228,7 @@ def act_policy_preview(ctx: dict) -> dict:
 
 
 @node(
-    name="ACTPolicyExport", category=_CATEGORY,
+    name="ACTPolicyExport", component="policy-artifacts", category=_CATEGORY,
     description="Export a trusted ACT checkpoint as an inference-only Blacknode policy artifact. Existing valid artifacts are reused unless overwrite is enabled.",
     inputs={
         "trigger": AnyPort,
@@ -286,7 +286,7 @@ def act_policy_export(ctx: dict) -> dict:
 
 
 @node(
-    name="PolicyArtifactLoad", category=_CATEGORY,
+    name="PolicyArtifactLoad", component="policy-artifacts", category=_CATEGORY,
     description="Load and validate an exported Blacknode policy artifact manifest without starting inference.",
     inputs={"trigger": AnyPort, "artifact_path": Text(default="")},
     outputs={"ok": Bool, "artifact": Dict, "policy_type": Text, "report": Text},
@@ -307,7 +307,7 @@ def policy_artifact_load(ctx: dict) -> dict:
 
 
 @node(
-    name="ACTPolicyReplay", category=_CATEGORY,
+    name="ACTPolicyReplay", component="policy-preview", category=_CATEGORY,
     description="Evaluate a loaded ACT policy across one recorded episode and emit a Dataset Browser-synchronized replay stream with prediction errors. Never commands hardware.",
     inputs={
         "trigger": AnyPort,

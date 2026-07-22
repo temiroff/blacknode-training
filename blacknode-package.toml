@@ -10,3 +10,33 @@ requires-blacknode = ">=0.1.0"
 [dependencies]
 pip = ["torch>=2.4", "h5py>=3.11", "numpy>=1.24"]
 imports = ["torch", "h5py", "numpy"]
+
+# Roadmap component; sources land in components/dataset-check/nodes.
+[components.dataset-check]
+description = "Pre-training dataset readiness checks."
+default = true
+capabilities = ["training.dataset-check"]
+
+# Roadmap component; sources land in components/training-jobs/nodes.
+[components.training-jobs]
+description = "Resumable policy training runs."
+default = true
+capabilities = ["training.jobs"]
+
+# Roadmap component; sources land in components/checkpoints/nodes.
+[components.checkpoints]
+description = "Checkpoint inspection and management."
+default = true
+capabilities = ["training.checkpoints"]
+
+# Roadmap component; sources land in components/policy-preview/nodes.
+[components.policy-preview]
+description = "Policy preview and replay against recorded episodes."
+default = true
+capabilities = ["training.preview"]
+
+# Roadmap component; sources land in components/policy-artifacts/nodes.
+[components.policy-artifacts]
+description = "Policy export and artifact loading."
+default = true
+capabilities = ["training.artifacts"]
