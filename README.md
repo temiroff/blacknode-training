@@ -1,5 +1,17 @@
 # blacknode-training
 
+Training is an explicit workload profile. Every component is optional in a
+normal robot runtime, and training workflows declare the exact set they need:
+
+```text
+blacknode-training
+├── dataset-check      optional
+├── training-jobs      optional
+├── checkpoints        optional
+├── policy-preview     optional
+└── policy-artifacts   optional
+```
+
 Blacknode-native robot policy training from the HDF5 episodes produced by
 `blacknode-dataset`. The package trains a compact vision-and-state
 action-chunking transformer in PyTorch, saves resumable checkpoints, reports

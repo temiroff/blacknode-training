@@ -14,6 +14,17 @@
     "required_packages": [
       "blacknode-training",
       "blacknode-dataset"
+    ],
+    "required_components": [
+      "blacknode-training/dataset-check",
+      "blacknode-training/training-jobs",
+      "blacknode-training/checkpoints",
+      "blacknode-training/policy-preview",
+      "blacknode-training/policy-artifacts",
+      "blacknode-dataset/recording",
+      "blacknode-dataset/validation",
+      "blacknode-dataset/export",
+      "blacknode-dataset/publishing"
     ]
   },
   "node_meta": {
