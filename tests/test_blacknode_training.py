@@ -5,12 +5,41 @@ import base64
 import json
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
 import blacknode  # noqa: F401 - triggers package discovery
 from blacknode.node import _NODE_REGISTRY
+from blacknode.packages import _PACKAGE_REGISTRY, load_package
+
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_DATASET_DIR = Path(__file__).resolve().parents[2] / "blacknode-dataset"
+with patch(
+    "blacknode.packages._read_component_overrides",
+    return_value=({
+        "dataset-check": True,
+        "training-jobs": True,
+        "checkpoints": True,
+        "policy-preview": True,
+        "policy-artifacts": True,
+    }, ""),
+):
+    load_package(_PACKAGE_DIR)
+with patch(
+    "blacknode.packages._read_component_overrides",
+    return_value=({
+        "recording": True,
+        "replay": True,
+        "validation": True,
+        "evaluation": False,
+        "export": True,
+        "publishing": True,
+    }, ""),
+):
+    load_package(_DATASET_DIR)
+
 from blacknode.pkg.blacknode_training import data, runtime
 from blacknode.pkg.blacknode_training.model import ActionChunkingConfig, ActionChunkingTransformer, masked_l1_loss
 from blacknode.workflow import validate_workflow
@@ -30,6 +59,11 @@ EXPECTED = {
     "TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview",
     "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
 }
+
+
+def test_training_components_are_optional_by_default():
+    info = _PACKAGE_REGISTRY["blacknode-training"]
+    assert not any(component["default"] for component in info.components.values())
 
 
 def _write_episode(path: Path, index: int, frames: int = 5) -> None:
