@@ -12,10 +12,10 @@ import pytest
 
 import blacknode  # noqa: F401 - triggers package discovery
 from blacknode.node import _NODE_REGISTRY
-from blacknode.packages import _PACKAGE_REGISTRY, load_package
+from blacknode.packages import _PACKAGE_REGISTRY, load_package, packages_root
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
-_DATASET_DIR = Path(__file__).resolve().parents[2] / "blacknode-dataset"
+_DATASET_DIR = packages_root() / "blacknode-dataset"
 with patch(
     "blacknode.packages._read_component_overrides",
     return_value=({
