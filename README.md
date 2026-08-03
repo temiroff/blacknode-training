@@ -1,143 +1,41 @@
 # blacknode-training
 
-Training is an explicit workload profile. Every component is optional in a
-normal robot runtime, and training workflows declare the exact set they need:
+`blacknode-training` provides offline robot-policy dataset checks, managed PyTorch training, resumable checkpoints, recorded-frame evaluation, and inference artifact export.
 
-```text
-blacknode-training
-├── dataset-check      optional
-├── training-jobs      optional
-├── checkpoints        optional
-├── policy-preview     optional
-└── policy-artifacts   optional
-```
+## Components
 
-Blacknode-native robot policy training from the HDF5 episodes produced by
-`blacknode-dataset`. The package trains a compact vision-and-state
-action-chunking transformer in PyTorch, saves resumable checkpoints, reports
-live metrics, and previews predictions against recorded frames.
+| Component | Purpose |
+|---|---|
+| `dataset-check` | Validate episode schema and readiness |
+| `training-jobs` | Start, monitor, stop, and resume ACT training |
+| `checkpoints` | Inspect checkpoint schema, metrics, and configuration |
+| `policy-preview` | Preview and replay predictions on recorded episodes |
+| `policy-artifacts` | Export and load inference artifacts |
 
-## Install
-
-Place this repository under `packages/blacknode-training` and restart
-Blacknode. Startup automatically installs declared dependencies:
-
-```text
-torch>=2.4
-h5py>=3.11
-numpy>=1.24
-```
-
-PyTorch is contained in this optional package, keeping recording installations
-focused on acquisition.
+All components are optional so normal robot runtimes do not install the training stack.
 
 ## Workflow
 
-1. Record successful episodes with `blacknode-dataset`.
-2. Open **Blacknode Native ACT Training**.
-3. Use `DatasetBrowser` to choose the dataset root and dataset ID.
-4. Press **Start / resume** on `ACTTraining`. Its upstream HDF5 exporter creates
-   the training view automatically or reuses a valid existing export.
-5. Watch the live phase, step counter, progress bar, losses, and dashboard. The
-   node refreshes every second; press **Stop** for a cooperative checkpointed
-   stop.
-6. Cook `ACTPolicyExport` after a checkpoint is available. It exports by
-   default and reuses an existing valid artifact unless `overwrite` is enabled.
-7. Cook `ACTPolicyReplay` to evaluate the selected episode, then cook the
-   connected `StreamPublisher` to stream predictions to evaluation apps.
+1. Record episodes with `blacknode-dataset`.
+2. Open `act-training.json` and select the dataset.
+3. Start or resume `ACTTraining`; the upstream HDF5 exporter prepares the training view.
+4. Monitor train/validation loss and stop cooperatively when needed.
+5. Export a checkpoint with `ACTPolicyExport`.
+6. Evaluate it with `ACTPolicyReplay` before using a separately armed controller.
 
-The browser selects the Blacknode-native dataset. The HDF5 export node produces
-the ACT training view and passes its path directly into dataset checking,
-training, and policy preview. Local operation nodes default to what their names
-promise: export, start/resume, evaluate, and stream. Diagnostic `check` and
-`status` actions remain available when needed.
+Training splits by episode and computes normalization from training episodes only. Checkpoints include model and optimizer state, ordered joints/cameras, dataset schema, normalization, configuration, and metrics. Exported policy artifacts omit optimizer state and retain the deployment contract.
 
-## Nodes
+## Safety
 
-| Node | Purpose |
-| --- | --- |
-| `TrainingDatasetCheck` | Validate episode files, state/action dimensions, joint order, cameras, FPS, frame counts, and finite numeric data. |
-| `ACTTraining` | Start, visibly monitor, stop, or automatically resume one managed background training run. Its dashboard shows phase, progress, train loss, validation loss, and failures. |
-| `ACTCheckpointInspect` | Read the fixed schema, normalization statistics, split, model configuration, step, and metrics from a checkpoint. |
-| `ACTPolicyPreview` | Predict and display a denormalized future action chunk for one recorded frame. |
-| `ACTPolicyExport` | Export model weights, schema, normalization, camera order, joint order, and metrics as an inference-only policy artifact. |
-| `PolicyArtifactLoad` | Validate and load an exported policy manifest for a deployment workflow. |
-| `ACTPolicyReplay` | Evaluate a loaded artifact across every frame in one recorded episode, report prediction error, and emit a browser-synchronized replay stream. |
+This package performs offline training and recorded-frame prediction only. It never commands hardware. Treat checkpoints as trusted executable data and review predictions before connecting an artifact to a motion controller.
 
-## Training contract
-
-The loader requires one or more `episode_<index>.hdf5` files with:
-
-```text
-/observations/qpos             float [T, state_dim]
-/observations/images/<camera>  uint8 [T, height, width, 3]
-/action                        float [T, action_dim]
-/metadata/joint_names          UTF-8 [state_dim]
-```
-
-Every episode must have the same state/action dimensions, ordered joint names,
-camera names, camera resolutions, and FPS. Validation rejects mismatches and
-non-finite state/action values; vectors and joint order are preserved exactly.
-
-Training and validation are split by whole episode. Normalization statistics
-are computed only from training episodes. At timestep `t`, the model receives
-the normalized follower joint state plus all RGB cameras and predicts
-`chunk_size` normalized future actions starting at `t`. Padded actions at the
-end of an episode are excluded from the L1 loss.
-
-The model is a Blacknode action-chunking transformer: a shared CNN
-encodes each camera into spatial tokens, a transformer encoder fuses those
-tokens with robot state, and learned action queries decode the future action
-chunk. Its fixed checkpoint contract keeps the dataset schema, normalization
-statistics, model configuration, and training state together.
-
-## Run outputs
-
-```text
-<output-dir>/
-  run.json
-  latest.json
-  checkpoint-00001000.pt
-  checkpoint-00002000.pt
-  ...
-```
-
-Each checkpoint includes model and optimizer state, model configuration,
-normalization statistics, dataset joint/camera schema, episode split, training
-configuration, and metrics. Writes use a temporary file and atomic rename.
-Only load checkpoints produced locally or by a trusted source.
-
-`ACTPolicyExport` writes `manifest.json` plus `model.pt`. The manifest is the
-stable handoff to Blacknode policy runtimes and declares absolute joint-position
-actions in radians, ordered joints and cameras, normalization statistics, and
-the source training step. The exported model omits optimizer state.
-
-`ACTPolicyReplay` checks the artifact and HDF5 dataset contracts before loading
-the model. Evaluation produces predicted actions, recorded targets, per-joint
-absolute error, episode MAE/RMSE/max error, and a `blacknode.replay-stream`
-handle. Connect that handle to `StreamPublisher`. When `sync_stream` receives
-`DatasetBrowser.stream`, the recorded video timeline controls policy replay, so
-Maya, ROS 2, Isaac Sim, and other subscribers see the prediction for the frame
-currently under review. This inference-only path never publishes robot commands.
-
-## Safety and limitations
-
-- This package performs offline training and recorded-frame prediction.
-- Hardware control belongs to an explicitly armed Blacknode policy controller.
-- Validation loss measures action imitation, not real-world task success.
-- Always inspect predictions and add a separately reviewed, disarmed safety
-  controller before using a trained policy on hardware.
-- Background jobs live in the Blacknode server process. Stop training before
-  restarting the server; completed checkpoints remain resumable.
-
-## Test
+## Install and verify
 
 ```powershell
+blacknode packages install https://github.com/temiroff/blacknode-training.git
 $env:PYTHONPATH="python"
 python -m pytest packages/blacknode-training/tests
 blacknode validate packages/blacknode-training/templates/act-training.json
 ```
 
-## License
-
-Apache-2.0, same as Blacknode.
+See [AGENTS.md](AGENTS.md) for dataset, checkpoint, and managed-job rules.
