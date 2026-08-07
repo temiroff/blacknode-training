@@ -428,11 +428,14 @@ def control_training_job(run_id: str, action: str) -> dict[str, Any]:
 def runtime_status() -> dict[str, Any]:
     with _jobs_lock:
         statuses = [job.status() for job in _jobs.values() if job.thread.is_alive()]
+    from . import ppo_runtime
+    ppo_statuses = list(ppo_runtime.runtime_status().get("managed_runs") or [])
+    managed_runs = statuses + ppo_statuses
     return {
         "ok": True,
-        "active": bool(statuses),
-        "managed_runs": statuses,
-        "report": f"{len(statuses)} active policy training job(s)",
+        "active": bool(managed_runs),
+        "managed_runs": managed_runs,
+        "report": f"{len(managed_runs)} active policy training job(s)",
     }
 
 
@@ -441,11 +444,20 @@ def stop_runtime_services() -> dict[str, Any]:
         jobs = [job for job in _jobs.values() if job.thread.is_alive()]
     for job in jobs:
         job.stop()
+    from . import ppo_runtime
+    ppo_result = ppo_runtime.stop_runtime_services()
+    ppo_count = int(dict(ppo_result.get("stopped") or {}).get("ppo_runs") or 0)
     return {
         "ok": True,
-        "stopped": {"managed_runs": len(jobs)},
-        "report": f"requested stop for {len(jobs)} policy training job(s)",
+        "stopped": {"managed_runs": len(jobs), "ppo_runs": ppo_count},
+        "report": f"requested stop for {len(jobs) + ppo_count} policy training job(s)",
     }
+
+
+def control_ppo_training_job(run_id: str, action: str) -> dict[str, Any]:
+    """Return editor-ready PPO live outputs for status/stop controls."""
+    from . import ppo_runtime
+    return ppo_runtime.control_training_job(run_id, action)
 
 
 def checkpoint_info(checkpoint_path: str | Path) -> dict[str, Any]:
@@ -538,8 +550,13 @@ def policy_artifact_info(artifact: str | Path | dict[str, Any]) -> dict[str, Any
         root = manifest_path.parent
     if manifest.get("kind") != "blacknode.policy-artifact" or int(manifest.get("schema_version") or 0) != 1:
         raise ValueError("unsupported policy artifact manifest")
-    if manifest.get("policy_type") != "act" or manifest.get("backend") != "blacknode-native":
-        raise ValueError("this runtime supports Blacknode-native ACT artifacts")
+    policy_type = str(manifest.get("policy_type") or "")
+    if manifest.get("backend") != "blacknode-native" or policy_type not in {"act", "ppo-so101-reach"}:
+        raise ValueError("unsupported Blacknode-native policy artifact")
+    if policy_type == "ppo-so101-reach":
+        safety = manifest.get("safety") if isinstance(manifest.get("safety"), dict) else {}
+        if safety.get("simulation_only") is not True or safety.get("physical_motion_authorized") is not False:
+            raise ValueError("PPO artifact is missing its simulation-only safety contract")
     model_path = root / str(manifest.get("model_file") or "")
     if not model_path.is_file():
         raise ValueError(f"policy model does not exist: {model_path}")
@@ -553,6 +570,8 @@ class ACTPolicy:
         data.require_dependencies(needs_torch=True)
         assert torch is not None and np is not None
         self.info = policy_artifact_info(artifact)
+        if self.info.get("policy_type") != "act":
+            raise ValueError("ACTPolicy requires an ACT policy artifact")
         self.device = _device(device_name)
         model_payload = _torch_load(Path(self.info["model_path"]), self.device)
         if model_payload.get("kind") != "blacknode.act-policy-model":

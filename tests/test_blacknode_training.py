@@ -16,6 +16,12 @@ from blacknode.packages import _PACKAGE_REGISTRY, load_package, packages_root
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 _DATASET_DIR = packages_root() / "blacknode-dataset"
+_NEWTON_DIR = packages_root() / "blacknode-newton"
+with patch(
+    "blacknode.packages._read_component_overrides",
+    return_value=({"viewer-ovrtx": False, "rosbridge": False, "replay": False}, ""),
+):
+    load_package(_NEWTON_DIR)
 with patch(
     "blacknode.packages._read_component_overrides",
     return_value=({
@@ -24,6 +30,7 @@ with patch(
         "checkpoints": True,
         "policy-preview": True,
         "policy-artifacts": True,
+        "reinforcement-learning": True,
     }, ""),
 ):
     load_package(_PACKAGE_DIR)
@@ -42,6 +49,7 @@ with patch(
 
 from blacknode.pkg.blacknode_training import data, runtime
 from blacknode.pkg.blacknode_training.model import ActionChunkingConfig, ActionChunkingTransformer, masked_l1_loss
+from blacknode.pkg.blacknode_training.ppo_model import PPOActorCritic, PPOModelConfig
 from blacknode.workflow import validate_workflow
 
 try:
@@ -58,6 +66,7 @@ except ImportError:
 EXPECTED = {
     "TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview",
     "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
+    "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport",
 }
 
 
@@ -95,6 +104,9 @@ def test_nodes_registered_and_motion_free():
     assert _NODE_REGISTRY["ACTTraining"]._bn_input_defaults["resume"] is True
     assert _NODE_REGISTRY["ACTPolicyExport"]._bn_input_defaults["action"] == "export"
     assert _NODE_REGISTRY["ACTPolicyReplay"]._bn_input_defaults["action"] == "evaluate"
+    assert _NODE_REGISTRY["PPOTraining"]._bn_input_defaults["viewer_enabled"] is True
+    assert _NODE_REGISTRY["PPOTraining"]._bn_input_defaults["viewer_fps"] == 15
+    assert "viewer_url" in _NODE_REGISTRY["PPOTraining"]._bn_outputs
 
 
 def test_status_is_non_mutating_and_dashboard_is_svg():
@@ -142,6 +154,27 @@ def test_model_shape_and_masked_loss():
     assert torch.isfinite(loss)
 
 
+def test_ppo_model_shape_and_disarmed_environment_check():
+    if torch is None:
+        pytest.skip("torch is installed by Blacknode package setup")
+    model = PPOActorCritic(PPOModelConfig(observation_dim=21, action_dim=6, hidden_dim=32))
+    observation = torch.randn(5, 21)
+    action, latent, log_probability, value = model.sample(observation)
+    assert action.shape == (5, 6)
+    assert latent.shape == (5, 6)
+    assert log_probability.shape == (5,)
+    assert value.shape == (5,)
+    assert torch.all(action.abs() <= 1.0)
+    unsafe = {
+        "kind": "blacknode.rl-environment",
+        "provider": {"environment_type": "so101-reach-v1"},
+        "safety": {"simulation_only": False, "physical_motion_authorized": True},
+    }
+    checked = _NODE_REGISTRY["PPOTraining"]({"action": "check", "environment": unsafe})
+    assert not checked["ok"]
+    assert "simulation-only" in checked["report"]
+
+
 def test_template_validates():
     path = Path(__file__).resolve().parents[1] / "templates" / "act-training.json"
     workflow = json.loads(path.read_text(encoding="utf-8"))
@@ -164,6 +197,28 @@ def test_template_validates():
         ("policy_load", "artifact", "policy_replay", "artifact"),
         ("dataset_browser", "stream", "policy_replay", "sync_stream"),
         ("policy_replay", "stream", "policy_stream", "stream"),
+    }
+
+
+def test_so101_ppo_template_validates_and_stays_simulation_only():
+    path = Path(__file__).resolve().parents[1] / "templates" / "so101-ppo-training.json"
+    workflow = json.loads(path.read_text(encoding="utf-8"))
+    external_task = _NODE_REGISTRY.get("SO101ReachTask", lambda _ctx: {})
+    with patch.dict(_NODE_REGISTRY, {"SO101ReachTask": external_task}):
+        result = validate_workflow(workflow)
+    assert result.ok, result.errors
+    assert workflow["entrypoint"] == {"node_id": "training", "port": "dashboard"}
+    assert workflow["node_meta"]["training"]["params"]["action"] == "start"
+    assert workflow["node_meta"]["training"]["params"]["resume"] is True
+    assert workflow["node_meta"]["training"]["params"]["viewer_enabled"] is True
+    assert workflow["node_meta"]["training"]["params"]["viewer_fps"] == 15
+    assert {"blacknode-newton", "blacknode-training"} <= set(workflow["metadata"]["required_packages"])
+    assert "blacknode-newton/viewer-viser" in workflow["metadata"]["required_components"]
+    assert (
+        "task", "environment", "training", "environment"
+    ) in {
+        (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
+        for edge in workflow["edges"]
     }
 
 
