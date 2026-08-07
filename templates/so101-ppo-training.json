@@ -1,0 +1,94 @@
+{
+  "kind": "blacknode.workflow",
+  "schema_version": 1,
+  "name": "SO-ARM101 PPO Training",
+  "saved_at": "2026-08-06T00:00:00Z",
+  "entrypoint": {"node_id": "training", "port": "dashboard"},
+  "metadata": {
+    "template": true,
+    "description": "Train a reaching policy on replicated SO-ARM101 arms with Newton, Warp, and PPO. All actions stay inside simulation and physical motion remains disarmed.",
+    "color": "#8b5cf6",
+    "required_packages": ["blacknode-newton", "blacknode-training"],
+    "required_components": [
+      "blacknode-newton/runtime",
+      "blacknode-newton/viewer-viser",
+      "blacknode-training/reinforcement-learning"
+    ]
+  },
+  "node_meta": {
+    "task": {
+      "id": "task", "type": "SO101ReachTask", "pos": [100, 170],
+      "params": {
+        "asset_path": "package://blacknode-newton/assets/so101_robot.usd",
+        "environment_count": 512, "episode_steps": 128,
+        "simulation_hz": 120, "control_hz": 30,
+        "action_scale_deg": 3.0, "success_tolerance_m": 0.025, "seed": 42
+      },
+      "inputs": ["trigger", "asset_path", "environment_count", "episode_steps", "simulation_hz", "control_hz", "action_scale_deg", "success_tolerance_m", "seed"],
+      "outputs": ["environment", "joint_names", "observation_dim", "action_dim", "report"],
+      "input_types": {"trigger": "Any", "asset_path": "Text", "environment_count": "Int", "episode_steps": "Int", "simulation_hz": "Int", "control_hz": "Int", "action_scale_deg": "Float", "success_tolerance_m": "Float", "seed": "Int"},
+      "output_types": {"environment": "Dict", "joint_names": "List", "observation_dim": "Int", "action_dim": "Int", "report": "Text"},
+      "input_defaults": {"asset_path": "package://blacknode-newton/assets/so101_robot.usd", "environment_count": 512, "episode_steps": 128, "simulation_hz": 120, "control_hz": 30, "action_scale_deg": 3.0, "success_tolerance_m": 0.025, "seed": 42},
+      "promoted_inputs": ["environment_count", "episode_steps", "action_scale_deg", "success_tolerance_m"],
+      "promoted_outputs": ["environment", "report"]
+    },
+    "training": {
+      "id": "training", "type": "PPOTraining", "pos": [520, 110],
+      "params": {
+        "action": "start", "environment": {}, "run_id": "so101-reach-ppo", "output_dir": "",
+        "device": "auto", "updates": 500, "rollout_steps": 32, "learning_rate": 0.0003,
+        "hidden_dim": 128, "epochs": 4, "minibatch_size": 4096,
+        "gamma": 0.99, "gae_lambda": 0.95, "clip_ratio": 0.2,
+        "entropy_coefficient": 0.01, "value_coefficient": 0.5, "max_gradient_norm": 0.5,
+        "checkpoint_every": 25, "seed": 42, "resume": true,
+        "viewer_enabled": true, "viewer_provider": "viser", "viewer_port": 8091,
+        "viewer_fps": 15, "viewer_environment_index": 0, "overwrite": false
+      },
+      "inputs": ["trigger", "action", "environment", "run_id", "output_dir", "device", "updates", "rollout_steps", "learning_rate", "hidden_dim", "epochs", "minibatch_size", "gamma", "gae_lambda", "clip_ratio", "entropy_coefficient", "value_coefficient", "max_gradient_norm", "checkpoint_every", "seed", "resume", "viewer_enabled", "viewer_provider", "viewer_port", "viewer_fps", "viewer_environment_index", "overwrite"],
+      "outputs": ["ok", "running", "phase", "update", "status", "dashboard", "viewer", "viewer_url", "checkpoint", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "environment": "Dict", "run_id": "Text", "output_dir": "Text", "device": "Text", "updates": "Int", "rollout_steps": "Int", "learning_rate": "Float", "hidden_dim": "Int", "epochs": "Int", "minibatch_size": "Int", "gamma": "Float", "gae_lambda": "Float", "clip_ratio": "Float", "entropy_coefficient": "Float", "value_coefficient": "Float", "max_gradient_norm": "Float", "checkpoint_every": "Int", "seed": "Int", "resume": "Bool", "viewer_enabled": "Bool", "viewer_provider": "Text", "viewer_port": "Int", "viewer_fps": "Int", "viewer_environment_index": "Int", "overwrite": "Bool"},
+      "output_types": {"ok": "Bool", "running": "Bool", "phase": "Text", "update": "Int", "status": "Dict", "dashboard": "Image", "viewer": "Dict", "viewer_url": "Text", "checkpoint": "Text", "report": "Text"},
+      "input_defaults": {"action": "start", "environment": {}, "run_id": "so101-reach-ppo", "output_dir": "", "device": "auto", "updates": 500, "rollout_steps": 32, "learning_rate": 0.0003, "hidden_dim": 128, "epochs": 4, "minibatch_size": 4096, "gamma": 0.99, "gae_lambda": 0.95, "clip_ratio": 0.2, "entropy_coefficient": 0.01, "value_coefficient": 0.5, "max_gradient_norm": 0.5, "checkpoint_every": 25, "seed": 42, "resume": true, "viewer_enabled": true, "viewer_provider": "viser", "viewer_port": 8091, "viewer_fps": 15, "viewer_environment_index": 0, "overwrite": false},
+      "input_choices": {"action": ["start", "status", "check", "stop"], "device": ["auto", "cuda", "cpu"], "viewer_provider": ["viser"]},
+      "promoted_inputs": ["action", "environment", "output_dir", "updates", "viewer_enabled", "viewer_environment_index", "overwrite"],
+      "promoted_outputs": ["dashboard", "viewer_url", "checkpoint", "report"]
+    },
+    "checkpoint": {
+      "id": "checkpoint", "type": "PPOCheckpointInspect", "pos": [950, 30],
+      "params": {"checkpoint_path": ""},
+      "inputs": ["trigger", "checkpoint_path"], "outputs": ["ok", "checkpoint", "update", "report"],
+      "input_types": {"trigger": "Any", "checkpoint_path": "Text"},
+      "output_types": {"ok": "Bool", "checkpoint": "Dict", "update": "Int", "report": "Text"},
+      "input_defaults": {"checkpoint_path": ""}
+    },
+    "evaluate": {
+      "id": "evaluate", "type": "PPOPolicyEvaluate", "pos": [950, 260],
+      "params": {"action": "evaluate", "checkpoint_path": "", "device": "auto", "environment_count": 64},
+      "inputs": ["trigger", "action", "checkpoint_path", "device", "environment_count"],
+      "outputs": ["ok", "evaluated", "metrics", "success_rate", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "device": "Text", "environment_count": "Int"},
+      "output_types": {"ok": "Bool", "evaluated": "Bool", "metrics": "Dict", "success_rate": "Float", "report": "Text"},
+      "input_defaults": {"action": "evaluate", "checkpoint_path": "", "device": "auto", "environment_count": 64},
+      "input_choices": {"action": ["evaluate", "check"], "device": ["auto", "cuda", "cpu"]},
+      "promoted_inputs": ["action", "checkpoint_path"], "promoted_outputs": ["metrics", "report"]
+    },
+    "export": {
+      "id": "export", "type": "PPOPolicyExport", "pos": [950, 510],
+      "params": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": false},
+      "inputs": ["trigger", "action", "checkpoint_path", "output_dir", "overwrite"],
+      "outputs": ["ok", "exported", "artifact", "artifact_path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "output_dir": "Text", "overwrite": "Bool"},
+      "output_types": {"ok": "Bool", "exported": "Bool", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": false},
+      "input_choices": {"action": ["export", "check"]},
+      "promoted_inputs": ["action", "checkpoint_path", "output_dir", "overwrite"],
+      "promoted_outputs": ["exported", "artifact_path", "report"]
+    }
+  },
+  "edges": [
+    {"from": "task", "from_port": "environment", "to": "training", "to_port": "environment"},
+    {"from": "training", "from_port": "checkpoint", "to": "checkpoint", "to_port": "checkpoint_path"},
+    {"from": "training", "from_port": "checkpoint", "to": "evaluate", "to_port": "checkpoint_path"},
+    {"from": "training", "from_port": "checkpoint", "to": "export", "to_port": "checkpoint_path"}
+  ]
+}

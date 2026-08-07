@@ -27,6 +27,7 @@ jobs:
         run: |
           mkdir -p core/packages
           git clone --depth 1 https://github.com/temiroff/blacknode-dataset.git core/packages/blacknode-dataset
+          git clone --depth 1 https://github.com/temiroff/blacknode-newton.git core/packages/blacknode-newton
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
