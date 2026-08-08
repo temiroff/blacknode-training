@@ -50,6 +50,7 @@ with patch(
 from blacknode.pkg.blacknode_training import data, runtime
 from blacknode.pkg.blacknode_training.model import ActionChunkingConfig, ActionChunkingTransformer, masked_l1_loss
 from blacknode.pkg.blacknode_training.ppo_model import PPOActorCritic, PPOModelConfig
+from blacknode.pkg.blacknode_training import ppo_runtime, rl_training
 from blacknode.workflow import validate_workflow
 
 try:
@@ -175,6 +176,61 @@ def test_ppo_model_shape_and_disarmed_environment_check():
     assert "simulation-only" in checked["report"]
 
 
+def test_ppo_run_waits_for_completion_and_emits_cloud_telemetry(
+    tmp_path: Path, capsys, monkeypatch,
+):
+    statuses = iter([
+        {"phase": "not_started", "running": False, "update": 0, "updates": 2},
+        {"phase": "running", "running": True, "update": 0, "updates": 2, "progress": 0.0},
+        {
+            "phase": "running", "running": True, "update": 1, "updates": 2,
+            "progress": 0.5, "mean_reward": 4.25,
+        },
+        {
+            "phase": "completed", "running": False, "update": 2, "updates": 2,
+            "progress": 1.0, "checkpoint": str(tmp_path / "checkpoint.pt"),
+        },
+    ])
+    monkeypatch.setattr(rl_training, "_config", lambda _ctx: ppo_runtime.PPOTrainingConfig(
+        run_id="cloud-demo", environment={}, output_dir=str(tmp_path / "run"), updates=2,
+    ))
+    monkeypatch.setattr(ppo_runtime, "job_status", lambda _run_id: next(statuses))
+    monkeypatch.setattr(ppo_runtime, "start_job", lambda _config: {"running": True})
+    monkeypatch.setattr(rl_training.time, "sleep", lambda _seconds: None)
+
+    result = _NODE_REGISTRY["PPOTraining"]({"action": "run", "run_id": "cloud-demo"})
+
+    output = capsys.readouterr().out
+    assert result["phase"] == "completed"
+    assert '"type":"progress","progress":100' in output
+    assert '"name":"mean_reward","value":4.25,"step":1' in output
+
+
+def test_ppo_evaluation_writes_json_next_to_checkpoint(tmp_path: Path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint-00000010.pt"
+    checkpoint.write_bytes(b"test")
+    monkeypatch.setattr(
+        ppo_runtime,
+        "checkpoint_info",
+        lambda _path: {"path": str(checkpoint), "update": 10},
+    )
+    monkeypatch.setattr(
+        ppo_runtime,
+        "evaluate_checkpoint",
+        lambda *_args: {
+            "kind": "blacknode.ppo-evaluation",
+            "success_rate": 0.75,
+            "mean_distance_m": 0.02,
+        },
+    )
+
+    result = _NODE_REGISTRY["PPOPolicyEvaluate"]({"checkpoint_path": str(checkpoint)})
+
+    assert result["ok"] and result["success_rate"] == 0.75
+    saved = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert saved["success_rate"] == 0.75
+
+
 def test_template_validates():
     path = Path(__file__).resolve().parents[1] / "templates" / "act-training.json"
     workflow = json.loads(path.read_text(encoding="utf-8"))
@@ -220,6 +276,16 @@ def test_so101_ppo_template_validates_and_stays_simulation_only():
         (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
         for edge in workflow["edges"]
     }
+
+    cloud_path = path.with_name("so101-ppo-cloud-demo.json")
+    cloud_workflow = json.loads(cloud_path.read_text(encoding="utf-8"))
+    with patch.dict(_NODE_REGISTRY, {"SO101ReachTask": external_task}):
+        cloud_result = validate_workflow(cloud_workflow)
+    assert cloud_result.ok, cloud_result.errors
+    assert cloud_workflow["entrypoint"] == {"node_id": "out", "port": "value"}
+    assert cloud_workflow["node_meta"]["training"]["params"]["action"] == "run"
+    assert cloud_workflow["node_meta"]["training"]["params"]["viewer_enabled"] is False
+    assert "blacknode-newton/viewer-viser" not in cloud_workflow["metadata"]["required_components"]
 
 
 @pytest.mark.skipif(h5py is None, reason="h5py is installed by package setup")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,40 @@ from . import ppo_runtime
 
 
 _CATEGORY = "Training"
+
+
+def _emit_cloud_event(payload: dict[str, Any]) -> None:
+    print(f"BLACKNODE_CLOUD_EVENT {json.dumps(payload, separators=(',', ':'))}", flush=True)
+
+
+def _wait_for_training(run_id: str) -> dict[str, Any]:
+    last_update = -1
+    while True:
+        status = ppo_runtime.job_status(run_id)
+        update = int(status.get("update") or 0)
+        if update != last_update:
+            progress = min(99, max(0, round(100 * float(status.get("progress") or 0.0))))
+            _emit_cloud_event({"type": "progress", "progress": progress})
+            for name in (
+                "mean_reward",
+                "mean_distance_m",
+                "success_rate",
+                "policy_loss",
+                "value_loss",
+                "frames_per_second",
+            ):
+                value = status.get(name)
+                if isinstance(value, int | float):
+                    _emit_cloud_event(
+                        {"type": "metric", "name": name, "value": value, "step": update}
+                    )
+            last_update = update
+        if not bool(status.get("running")):
+            if status.get("phase") == "failed" or status.get("error"):
+                raise RuntimeError(str(status.get("error") or "PPO training failed"))
+            _emit_cloud_event({"type": "progress", "progress": 100})
+            return status
+        time.sleep(0.25)
 
 
 def _run_id(value: Any) -> str:
@@ -75,7 +110,7 @@ def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
     ),
     inputs={
         "trigger": AnyPort,
-        "action": Enum(["start", "status", "check", "stop"], default="start"),
+        "action": Enum(["start", "run", "status", "check", "stop"], default="start"),
         "environment": Dict(default={}),
         "run_id": Text(default="so101-reach-ppo"),
         "output_dir": Text(default=""),
@@ -128,7 +163,7 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
                     "device": config.device,
                     "environment_count": int(config.environment["environment_count"]),
                 }
-            elif action == "start":
+            elif action in {"start", "run"}:
                 current = ppo_runtime.job_status(run_id)
                 if bool(current.get("running")):
                     status = current
@@ -138,6 +173,7 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
                         shutil.rmtree(output)
                         checkpoints = []
                         config = replace(config, resume=False)
+                        status = ppo_runtime.start_job(config)
                     elif checkpoints:
                         latest = ppo_runtime.checkpoint_info(checkpoints[-1])
                         if int(latest["update"]) >= config.updates:
@@ -161,10 +197,14 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
                                     f"output_dir contains unrelated data: {output}; enable overwrite to restart"
                                 )
                         status = ppo_runtime.start_job(replace(config, resume=False))
+                if action == "run":
+                    status = _wait_for_training(run_id)
             else:
-                raise ValueError("action must be status, check, start, or stop")
+                raise ValueError("action must be status, check, start, run, or stop")
         return ppo_runtime.node_outputs(status)
     except Exception as exc:  # noqa: BLE001
+        if action == "run":
+            raise
         status = {
             **ppo_runtime.job_status(str(ctx.get("run_id") or "so101-reach-ppo")),
             "phase": "failed", "error": str(exc),
@@ -210,6 +250,9 @@ def ppo_policy_evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
             info["path"], str(ctx.get("device") or "auto"),
             max(1, int(ctx.get("environment_count") or 64)),
         )
+        evaluation_path = Path(info["path"]).parent / "evaluation.json"
+        ppo_runtime._atomic_json(evaluation_path, metrics)
+        metrics = {**metrics, "path": str(evaluation_path)}
         return {"ok": True, "evaluated": True, "metrics": metrics,
                 "success_rate": float(metrics["success_rate"]),
                 "report": (

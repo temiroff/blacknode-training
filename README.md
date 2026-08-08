@@ -29,6 +29,12 @@ a cooperative stop; running the same output directory with `resume=true`
 continues from the newest checkpoint. Use `PPOPolicyEvaluate` before exporting a
 simulation-only artifact with `PPOPolicyExport`.
 
+For a one-shot local or Cloud container run, open `SO-ARM101 PPO Cloud Demo`.
+Its `PPOTraining` node uses `action=run`, waits for the managed training thread,
+emits progress and reward metrics, evaluates the final checkpoint, and exports
+`evaluation.json` plus `policy.pt`. The ordinary PPO template keeps
+`action=start` for interactive editor control.
+
 With `viewer_enabled=true`, training starts a read-only Viser preview and
 Blacknode opens it in the simulation pane. The preview copies one selected arm
 into a separate one-articulation render model at up to `viewer_fps` (15 by
