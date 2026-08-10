@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -25,32 +26,35 @@ with patch(
 with patch(
     "blacknode.packages._read_component_overrides",
     return_value=({
-        "dataset-check": True,
-        "training-jobs": True,
-        "checkpoints": True,
-        "policy-preview": True,
-        "policy-artifacts": True,
-        "reinforcement-learning": True,
-    }, ""),
-):
-    load_package(_PACKAGE_DIR)
-with patch(
-    "blacknode.packages._read_component_overrides",
-    return_value=({
         "recording": True,
         "replay": True,
         "validation": True,
         "evaluation": False,
         "export": True,
         "publishing": True,
+        "adapters": True,
     }, ""),
 ):
     load_package(_DATASET_DIR)
+with patch(
+    "blacknode.packages._read_component_overrides",
+    return_value=({
+        "dataset-check": True,
+        "training-jobs": True,
+        "checkpoints": True,
+        "policy-preview": True,
+        "policy-artifacts": True,
+        "reinforcement-learning": True,
+        "vla-openpi": True,
+    }, ""),
+):
+    load_package(_PACKAGE_DIR)
 
 from blacknode.pkg.blacknode_training import data, runtime
 from blacknode.pkg.blacknode_training.model import ActionChunkingConfig, ActionChunkingTransformer, masked_l1_loss
 from blacknode.pkg.blacknode_training.ppo_model import PPOActorCritic, PPOModelConfig
 from blacknode.pkg.blacknode_training import ppo_runtime, rl_training
+from blacknode.pkg.blacknode_training.vla_openpi import OpenPIProvider, VLATrainConfig
 from blacknode.workflow import validate_workflow
 
 try:
@@ -69,6 +73,7 @@ EXPECTED = {
     "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
     "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport",
     "PPOPolicyImport",
+    "OpenPIFineTune",
 }
 
 
@@ -115,6 +120,8 @@ def test_nodes_registered_and_motion_free():
     assert "viewer_provider" in _NODE_REGISTRY["PPOTraining"]._bn_primary_inputs
     assert "viewer_url" in _NODE_REGISTRY["PPOTraining"]._bn_outputs
     assert "viewer_running" in _NODE_REGISTRY["PPOTraining"]._bn_outputs
+    assert _NODE_REGISTRY["OpenPIFineTune"]._bn_input_defaults["action"] == "run"
+    assert _NODE_REGISTRY["OpenPIFineTune"]._bn_input_defaults["resume"] is True
 
 
 def test_status_is_non_mutating_and_dashboard_is_svg():
@@ -410,6 +417,74 @@ def test_template_validates():
         ("dataset_browser", "stream", "policy_replay", "sync_stream"),
         ("policy_replay", "stream", "policy_stream", "stream"),
     }
+
+
+def test_openpi_template_is_a_direct_outcome_workflow():
+    path = Path(__file__).resolve().parents[1] / "templates" / "openpi-pi05-finetune.json"
+    workflow = json.loads(path.read_text(encoding="utf-8"))
+    result = validate_workflow(workflow)
+    assert result.ok, result.errors
+    assert workflow["entrypoint"] == {"node_id": "train", "port": "model"}
+    assert [node["type"] for node in workflow["node_meta"].values()] == [
+        "LeRobotDataset", "OpenPIFineTune",
+    ]
+    assert workflow["node_meta"]["train"]["params"]["action"] == "run"
+    assert workflow["metadata"]["cloud"]["workload"] == "vla_train"
+
+
+def test_openpi_provider_requires_an_immutable_remote_dataset(tmp_path: Path):
+    config = VLATrainConfig(
+        run_id="test",
+        dataset={"kind": "blacknode.dataset-source", "uri": "hf://owner/dataset"},
+        output_dir=str(tmp_path / "run"),
+    )
+    with pytest.raises(ValueError, match="immutable revision"):
+        OpenPIProvider().validate(config)
+
+
+def test_openpi_provider_runs_and_exports_a_vla_model(tmp_path: Path):
+    runner = tmp_path / "fake_openpi.py"
+    runner.write_text(
+        "import json, pathlib, sys\n"
+        "request = pathlib.Path(sys.argv[sys.argv.index('--request') + 1])\n"
+        "output = request.parent\n"
+        "checkpoint = output / 'checkpoints' / '1'\n"
+        "checkpoint.mkdir(parents=True)\n"
+        "(checkpoint / 'params').write_bytes(b'openpi-adapter')\n"
+        "norm = output / 'norm_stats.json'\n"
+        "norm.write_text('{\\\"action\\\": {}}')\n"
+        "print('Step 1: loss=0.25, grad_norm=1.5', flush=True)\n"
+        "(output / 'openpi-result.json').write_text(json.dumps({"
+        "'checkpoint_dir': str(checkpoint), 'norm_stats_path': str(norm), "
+        "'final_step': 1, 'metrics': {'loss': 0.25}, "
+        "'inference': {'verified': True}}))\n",
+        encoding="utf-8",
+    )
+    config = VLATrainConfig(
+        run_id="real-output",
+        dataset={
+            "kind": "blacknode.dataset-source",
+            "uri": "hf://owner/dataset",
+            "revision": "a" * 40,
+        },
+        output_dir=str(tmp_path / "run"),
+        steps=1,
+        runner_path=str(runner),
+    )
+    provider = OpenPIProvider()
+    prepared = provider.prepare(config)
+    events = []
+    result = provider.train(prepared, events.append, threading.Event())
+    model = provider.export(prepared, result)
+
+    assert model["kind"] == "blacknode.vla-model"
+    assert model["architecture"] == "pi05"
+    assert model["backend"] == "jax"
+    assert model["training_method"] == "lora"
+    assert model["dataset"]["revision"] == "a" * 40
+    assert model["inference"]["verified"] is True
+    assert (Path(model["path"]) / model["checkpoint"]).is_file()
+    assert any(event.get("name") == "loss" for event in events)
 
 
 def test_so101_ppo_template_validates_and_stays_simulation_only():

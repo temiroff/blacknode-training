@@ -1,0 +1,66 @@
+{
+  "kind": "blacknode.workflow",
+  "schema_version": 1,
+  "name": "OpenPI π0.5 Fine-Tune",
+  "saved_at": "2026-08-10T00:00:00Z",
+  "entrypoint": {"node_id": "train", "port": "model"},
+  "metadata": {
+    "template": true,
+    "description": "Resolve an immutable LeRobot dataset, fine-tune OpenPI π0.5 with JAX LoRA, and produce a Blacknode VLA model artifact.",
+    "color": "#f97316",
+    "required_packages": ["blacknode-dataset", "blacknode-training"],
+    "required_components": ["blacknode-dataset/adapters", "blacknode-training/vla-openpi"],
+    "cloud": {
+      "workload": "vla_train",
+      "gpu_class": "l40s",
+      "artifact_outputs": ["model/manifest.json", "model/adapter-checkpoint.tar.gz", "model/norm_stats.json", "metrics.jsonl"]
+    },
+    "safety": {"physical_motion_authorized": false}
+  },
+  "node_meta": {
+    "dataset": {
+      "id": "dataset",
+      "type": "LeRobotDataset",
+      "pos": [100, 180],
+      "params": {"uri": "hf://lerobot/aloha_sim_insertion_human", "revision": "PIN_DATASET_COMMIT", "source_uri": ""},
+      "inputs": ["trigger", "uri", "revision", "source_uri"],
+      "outputs": ["dataset", "uri", "revision", "report"],
+      "input_types": {"trigger": "Any", "uri": "Text", "revision": "Text", "source_uri": "Text"},
+      "output_types": {"dataset": "Dict", "uri": "Text", "revision": "Text", "report": "Text"},
+      "input_defaults": {"uri": "", "revision": "", "source_uri": ""},
+      "promoted_inputs": ["uri", "revision"],
+      "promoted_outputs": ["dataset", "report"]
+    },
+    "train": {
+      "id": "train",
+      "type": "OpenPIFineTune",
+      "pos": [560, 120],
+      "params": {
+        "action": "run",
+        "dataset": {},
+        "run_id": "pi05-lora",
+        "output_dir": "",
+        "steps": 5000,
+        "batch_size": 8,
+        "action_horizon": 10,
+        "action_mode": "absolute_joint",
+        "learning_rate": 0.00005,
+        "save_interval": 1000,
+        "seed": 42,
+        "resume": true,
+        "overwrite": false
+      },
+      "inputs": ["trigger", "action", "dataset", "run_id", "output_dir", "steps", "batch_size", "action_horizon", "action_mode", "learning_rate", "save_interval", "seed", "resume", "overwrite"],
+      "outputs": ["ok", "running", "phase", "step", "progress", "status", "metrics", "model", "model_path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "dataset": "Dict", "run_id": "Text", "output_dir": "Text", "steps": "Int", "batch_size": "Int", "action_horizon": "Int", "action_mode": "Text", "learning_rate": "Float", "save_interval": "Int", "seed": "Int", "resume": "Bool", "overwrite": "Bool"},
+      "output_types": {"ok": "Bool", "running": "Bool", "phase": "Text", "step": "Int", "progress": "Float", "status": "Dict", "metrics": "Dict", "model": "Dict", "model_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "run", "dataset": {}, "run_id": "pi05-lora", "output_dir": "", "steps": 5000, "batch_size": 8, "action_horizon": 10, "action_mode": "absolute_joint", "learning_rate": 0.00005, "save_interval": 1000, "seed": 42, "resume": true, "overwrite": false},
+      "input_choices": {"action": ["run", "start", "status", "stop", "check"], "action_mode": ["absolute_joint", "delta"]},
+      "promoted_inputs": ["action", "steps", "batch_size", "output_dir"],
+      "promoted_outputs": ["model", "progress", "metrics", "report"]
+    }
+  },
+  "edges": [
+    {"from": "dataset", "from_port": "dataset", "to": "train", "to_port": "dataset"}
+  ]
+}

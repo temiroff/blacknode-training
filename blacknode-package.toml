@@ -1,7 +1,7 @@
 [package]
 name = "blacknode-training"
-version = "0.3.5"
-description = "Blacknode-native robot policy training, resumable checkpoints, previews, and policy artifacts."
+version = "0.4.0"
+description = "Blacknode-native robot policy and VLA training, resumable checkpoints, previews, and model artifacts."
 requires-blacknode = ">=0.1.0"
 layer = "learning"
 component-mode = true
@@ -74,4 +74,15 @@ node-types = [
 [components.reinforcement-learning.dependencies]
 requires = [
   { package = "blacknode-newton", component = "runtime", version = ">=0.1.3,<1" }
+]
+
+[components.vla-openpi]
+description = "OpenPI π0.5 JAX LoRA training and Blacknode VLA model export."
+default = false
+capabilities = ["training.vla", "training.vla.openpi"]
+node-types = ["OpenPIFineTune"]
+
+[components.vla-openpi.dependencies]
+requires = [
+  { package = "blacknode-dataset", component = "adapters", version = ">=0.3,<1" }
 ]
