@@ -495,7 +495,7 @@ def export_policy_artifact(checkpoint_path: str | Path, output_dir: str | Path, 
     if output.exists() and any(output.iterdir()) and not overwrite:
         raise FileExistsError(f"policy artifact directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
-    model_path = output / "model.pt"
+    model_path = output / "policy.pt"
     temporary = model_path.with_suffix(".pt.tmp")
     torch.save({
         "kind": "blacknode.ppo-policy-model", "schema_version": 1,
