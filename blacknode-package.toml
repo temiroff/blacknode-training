@@ -1,6 +1,6 @@
 [package]
 name = "blacknode-training"
-version = "0.3.2"
+version = "0.3.5"
 description = "Blacknode-native robot policy training, resumable checkpoints, previews, and policy artifacts."
 requires-blacknode = ">=0.1.0"
 layer = "learning"
@@ -67,10 +67,11 @@ description = "Managed PPO training and simulation evaluation for vectorized rob
 default = false
 capabilities = ["training.reinforcement-learning", "training.ppo"]
 node-types = [
-  "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport"
+  "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport",
+  "PPOPolicyImport"
 ]
 
 [components.reinforcement-learning.dependencies]
 requires = [
-  { package = "blacknode-newton", component = "runtime", version = ">=0.1,<1" }
+  { package = "blacknode-newton", component = "runtime", version = ">=0.1.3,<1" }
 ]

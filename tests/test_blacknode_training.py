@@ -68,6 +68,7 @@ EXPECTED = {
     "TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview",
     "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
     "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport",
+    "PPOPolicyImport",
 }
 
 
@@ -107,7 +108,13 @@ def test_nodes_registered_and_motion_free():
     assert _NODE_REGISTRY["ACTPolicyReplay"]._bn_input_defaults["action"] == "evaluate"
     assert _NODE_REGISTRY["PPOTraining"]._bn_input_defaults["viewer_enabled"] is True
     assert _NODE_REGISTRY["PPOTraining"]._bn_input_defaults["viewer_fps"] == 15
+    assert _NODE_REGISTRY["PPOTraining"]._bn_input_defaults["replay_episodes"] == 3
+    assert _NODE_REGISTRY["PPOTraining"]._bn_input_choices["viewer_provider"] == [
+        "viser", "ovrtx",
+    ]
+    assert "viewer_provider" in _NODE_REGISTRY["PPOTraining"]._bn_primary_inputs
     assert "viewer_url" in _NODE_REGISTRY["PPOTraining"]._bn_outputs
+    assert "viewer_running" in _NODE_REGISTRY["PPOTraining"]._bn_outputs
 
 
 def test_status_is_non_mutating_and_dashboard_is_svg():
@@ -122,6 +129,79 @@ def test_status_is_non_mutating_and_dashboard_is_svg():
     controlled = runtime.control_training_job("never-started", "status")
     assert controlled["phase"] == "not_started"
     assert controlled["dashboard"].startswith(prefix)
+
+
+@pytest.mark.skipif(torch is None, reason="torch is installed by package setup")
+def test_ppo_policy_builds_shared_semantic_observation_and_absolute_sim_target(tmp_path: Path):
+    environment = {
+        "kind": "blacknode.rl-environment", "schema_version": 1,
+        "provider": {"environment_type": "so101-reach-v1"},
+        "robot_profile": "so_arm101", "joint_names": ["shoulder", "gripper"],
+        "observation": {"dimension": 9},
+        "action": {"dimension": 2, "minimum": -1.0, "maximum": 1.0, "scale_rad": 0.1},
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    config = PPOModelConfig(observation_dim=9, action_dim=2, hidden_dim=32)
+    model = PPOActorCritic(config)
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    torch.save({
+        "kind": "blacknode.ppo-policy-model", "schema_version": 1,
+        "model_config": config.to_dict(), "model_state": model.state_dict(),
+    }, tmp_path / "policy.pt")
+    manifest = {
+        "kind": "blacknode.policy-artifact", "schema_version": 1,
+        "policy_type": "ppo-so101-reach", "backend": "blacknode-native",
+        "model_format": "blacknode-ppo-state-dict", "path": str(tmp_path),
+        "model_file": "policy.pt", "action_mode": "bounded_joint_position_delta",
+        "units": "normalized", "joint_names": ["shoulder", "gripper"],
+        "camera_names": [], "state_dim": 9, "action_dim": 2,
+        "environment": environment,
+        "compatibility_contract": ppo_runtime.ppo_observation_contract(environment),
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    policy = ppo_runtime.PPOPolicy(tmp_path, "cpu")
+    prediction = policy.predict(
+        [0.2, 0.3], {}, context={
+            "joint_velocities": {"shoulder": 0.0, "gripper": 0.0},
+            "joint_limits": {"shoulder": [-1.0, 1.0], "gripper": [0.0, 0.8]},
+            "target_m": [0.2, 0.0, 0.3], "end_effector_m": [0.1, 0.0, 0.2],
+        },
+    )
+
+    assert prediction["action"] == pytest.approx([0.2, 0.3])
+    assert prediction["normalized_action"] == pytest.approx([0.0, 0.0])
+    assert prediction["physical_motion_authorized"] is False
+
+
+@pytest.mark.skipif(torch is None, reason="torch is installed by package setup")
+def test_imported_isaac_torchscript_actor_uses_shared_ppo_artifact_contract(tmp_path: Path):
+    class Actor(torch.nn.Module):
+        def forward(self, observation):
+            return observation[:, :2] * 0.0
+
+    source = tmp_path / "isaac-actor.pt"
+    torch.jit.trace(Actor(), torch.zeros((1, 9), dtype=torch.float32)).save(str(source))
+    environment = {
+        "kind": "blacknode.rl-environment", "schema_version": 1,
+        "provider": {"environment_type": "so101-reach-v1"},
+        "robot_profile": "so_arm101", "joint_names": ["shoulder", "gripper"],
+        "observation": {"dimension": 9},
+        "action": {"dimension": 2, "minimum": -1.0, "maximum": 1.0, "scale_rad": 0.1},
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+
+    artifact = ppo_runtime.import_torchscript_policy(
+        source, environment, tmp_path / "artifact", source="isaac-lab"
+    )
+
+    assert artifact["model_format"] == "torchscript"
+    assert artifact["source"] == "isaac-lab"
+    assert artifact["compatible_simulators"] == ["newton", "isaac-sim"]
+    assert artifact["compatibility_contract"]["observation"]["dimension"] == 9
+    assert ppo_runtime.PPOPolicy(artifact, "cpu").model_format == "torchscript"
 
 
 def test_dashboard_wraps_long_errors_without_truncating_text():
@@ -206,6 +286,82 @@ def test_ppo_run_waits_for_completion_and_emits_cloud_telemetry(
     assert '"name":"mean_reward","value":4.25,"step":1' in output
 
 
+def test_ppo_replay_uses_latest_checkpoint_and_managed_one_arm_job(
+    tmp_path: Path, monkeypatch,
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    checkpoint = output / "checkpoint-00000500.pt"
+    checkpoint.write_bytes(b"test")
+    environment = {
+        "kind": "blacknode.rl-environment",
+        "provider": {"environment_type": "so101-reach-v1"},
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    monkeypatch.setattr(rl_training, "_config", lambda _ctx: ppo_runtime.PPOTrainingConfig(
+        run_id="replay-test", environment=environment, output_dir=str(output),
+        viewer_enabled=True, viewer_port=8091,
+    ))
+    captured: list[ppo_runtime.PPOReplayConfig] = []
+
+    def start_replay(config):
+        captured.append(config)
+        return {
+            "phase": "replaying", "running": True, "viewer_running": True,
+            "mode": "replay", "update": 500, "updates": 500,
+            "replay_episode": 1, "replay_episodes": config.episodes,
+            "checkpoint": config.checkpoint_path,
+            "viewer_url": "http://127.0.0.1:8091",
+            "viewer": {"running": True, "viewer_url": "http://127.0.0.1:8091"},
+        }
+
+    monkeypatch.setattr(ppo_runtime, "start_replay_job", start_replay)
+    result = _NODE_REGISTRY["PPOTraining"]({
+        "action": "replay", "environment": environment,
+        "run_id": "replay-test", "replay_episodes": 4,
+    })
+
+    assert result["running"] and result["viewer_running"]
+    assert result["mode"] == "replay"
+    assert result["checkpoint"] == str(checkpoint)
+    assert captured[0].episodes == 4
+    assert captured[0].checkpoint_path == str(checkpoint)
+
+
+def test_completed_ppo_viewer_remains_a_managed_service(monkeypatch):
+    class Thread:
+        @staticmethod
+        def is_alive():
+            return False
+
+    class Job:
+        thread = Thread()
+
+        def __init__(self):
+            self.closed = False
+
+        def status(self):
+            return {
+                "run_id": "finished", "phase": "completed", "running": False,
+                "viewer_running": not self.closed, "service_running": not self.closed,
+                "viewer_url": "" if self.closed else "http://127.0.0.1:8091",
+                "viewer": {"running": not self.closed},
+            }
+
+        def close_viewer(self):
+            self.closed = True
+
+    job = Job()
+    monkeypatch.setattr(ppo_runtime, "_jobs", {"finished": job})
+
+    status = ppo_runtime.runtime_status()
+    assert status["active"]
+    assert status["managed_runs"][0]["phase"] == "completed"
+    closed = ppo_runtime.close_job_viewer("finished")
+    assert not closed["viewer_running"]
+    assert not ppo_runtime.runtime_status()["active"]
+
+
 def test_ppo_evaluation_writes_json_next_to_checkpoint(tmp_path: Path, monkeypatch):
     checkpoint = tmp_path / "checkpoint-00000010.pt"
     checkpoint.write_bytes(b"test")
@@ -268,6 +424,13 @@ def test_so101_ppo_template_validates_and_stays_simulation_only():
     assert workflow["node_meta"]["training"]["params"]["resume"] is True
     assert workflow["node_meta"]["training"]["params"]["viewer_enabled"] is True
     assert workflow["node_meta"]["training"]["params"]["viewer_fps"] == 15
+    assert workflow["node_meta"]["training"]["params"]["replay_episodes"] == 3
+    assert "replay" in workflow["node_meta"]["training"]["input_choices"]["action"]
+    assert workflow["node_meta"]["training"]["input_choices"]["viewer_provider"] == [
+        "viser", "ovrtx",
+    ]
+    assert "viewer_provider" in workflow["node_meta"]["training"]["promoted_inputs"]
+    assert "viewer_running" in workflow["node_meta"]["training"]["outputs"]
     assert {"blacknode-newton", "blacknode-training"} <= set(workflow["metadata"]["required_packages"])
     assert "blacknode-newton/viewer-viser" in workflow["metadata"]["required_components"]
     assert (
@@ -286,6 +449,21 @@ def test_so101_ppo_template_validates_and_stays_simulation_only():
     assert cloud_workflow["node_meta"]["training"]["params"]["action"] == "run"
     assert cloud_workflow["node_meta"]["training"]["params"]["viewer_enabled"] is False
     assert "blacknode-newton/viewer-viser" not in cloud_workflow["metadata"]["required_components"]
+
+    import_path = path.with_name("so101-ppo-isaac-import.json")
+    import_workflow = json.loads(import_path.read_text(encoding="utf-8"))
+    with patch.dict(_NODE_REGISTRY, {"SO101ReachTask": external_task}):
+        import_result = validate_workflow(import_workflow)
+    assert import_result.ok, import_result.errors
+    assert import_workflow["entrypoint"] == {"node_id": "evaluate", "port": "metrics"}
+    assert import_workflow["node_meta"]["import"]["params"]["action"] == "check"
+    assert import_workflow["node_meta"]["evaluate"]["params"]["action"] == "check"
+    assert (
+        "import", "artifact", "evaluate", "artifact"
+    ) in {
+        (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
+        for edge in import_workflow["edges"]
+    }
 
 
 @pytest.mark.skipif(h5py is None, reason="h5py is installed by package setup")

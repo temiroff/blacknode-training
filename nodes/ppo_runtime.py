@@ -5,6 +5,7 @@ import atexit
 import base64
 import html
 import json
+import shutil
 import textwrap
 import threading
 import time
@@ -55,6 +56,17 @@ class PPOTrainingConfig:
     viewer_environment_index: int = 0
 
 
+@dataclass(frozen=True)
+class PPOReplayConfig:
+    run_id: str
+    checkpoint_path: str
+    device: str = "auto"
+    episodes: int = 3
+    viewer_provider: str = "viser"
+    viewer_port: int = 8091
+    viewer_fps: int = 15
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -97,6 +109,186 @@ def _validate_environment(value: dict[str, Any]) -> dict[str, Any]:
     return environment
 
 
+def ppo_observation_contract(environment: dict[str, Any]) -> dict[str, Any]:
+    """Return the simulator-neutral observation/action contract for SO-101 reach."""
+    spec = _validate_environment(environment)
+    joint_names = [str(name) for name in spec.get("joint_names") or []]
+    joint_count = len(joint_names)
+    if joint_count <= 0:
+        raise ValueError("PPO environment must declare ordered joint_names")
+    observation = dict(spec.get("observation") or {})
+    action = dict(spec.get("action") or {})
+    expected_observation = joint_count * 3 + 3
+    if int(observation.get("dimension") or 0) != expected_observation:
+        raise ValueError(
+            f"SO-ARM101 PPO observation dimension must be {expected_observation}"
+        )
+    if int(action.get("dimension") or 0) != joint_count:
+        raise ValueError("SO-ARM101 PPO action dimension must match joint_names")
+    return {
+        "kind": "blacknode.ppo-compatibility-contract",
+        "schema_version": 1,
+        "environment_type": "so101-reach-v1",
+        "robot_profile": str(spec.get("robot_profile") or "so_arm101"),
+        "joint_names": joint_names,
+        "observation": {
+            "dimension": expected_observation,
+            "fields": [
+                {
+                    "name": "normalized_joint_positions", "size": joint_count,
+                    "source": "joint_positions_rad", "normalization": "joint_limits",
+                },
+                {
+                    "name": "scaled_joint_velocities", "size": joint_count,
+                    "source": "joint_velocities_rad_s", "scale": 0.05,
+                },
+                {
+                    "name": "scaled_target_minus_end_effector", "size": 3,
+                    "source": "target_minus_end_effector_m", "divisor": 0.5,
+                },
+                {
+                    "name": "previous_normalized_action", "size": joint_count,
+                    "source": "previous_action", "initial": 0.0,
+                },
+            ],
+        },
+        "action": {
+            "dimension": joint_count,
+            "type": "bounded_joint_position_delta",
+            "minimum": float(action.get("minimum", -1.0)),
+            "maximum": float(action.get("maximum", 1.0)),
+            "scale_rad": float(action.get("scale_rad") or 0.0),
+            "output_application": "current_position_plus_scaled_delta",
+        },
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+
+
+def _policy_device(device_name: str) -> Any:
+    _require_torch()
+    requested = str(device_name or "auto").strip().lower()
+    if requested == "auto":
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda":
+        requested = "cuda:0"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but PyTorch cannot access a CUDA device")
+    return torch.device(requested)
+
+
+class PPOPolicy:
+    """Prediction-only PPO artifact shared by Newton and simulator adapters."""
+
+    def __init__(self, artifact: str | Path | dict[str, Any], device_name: str = "auto") -> None:
+        from .runtime import policy_artifact_info
+
+        self.info = policy_artifact_info(artifact)
+        if self.info.get("policy_type") != "ppo-so101-reach":
+            raise ValueError("PPOPolicy requires a ppo-so101-reach policy artifact")
+        self.contract = dict(
+            self.info.get("compatibility_contract")
+            or ppo_observation_contract(dict(self.info.get("environment") or {}))
+        )
+        self.joint_names = [str(name) for name in self.contract.get("joint_names") or []]
+        self.device = _policy_device(device_name)
+        self.model_format = str(
+            self.info.get("model_format") or "blacknode-ppo-state-dict"
+        )
+        model_path = Path(str(self.info["model_path"]))
+        if self.model_format == "torchscript":
+            self.model = torch.jit.load(str(model_path), map_location=self.device)
+        elif self.model_format == "blacknode-ppo-state-dict":
+            payload = _torch_load(model_path, self.device)
+            if payload.get("kind") != "blacknode.ppo-policy-model":
+                raise ValueError("artifact model is not a Blacknode PPO policy model")
+            config = PPOModelConfig.from_dict(dict(payload["model_config"]))
+            self.model = PPOActorCritic(config).to(self.device)
+            self.model.load_state_dict(payload["model_state"])
+        else:
+            raise ValueError(f"unsupported PPO model_format: {self.model_format}")
+        self.model.eval()
+        self.previous_action = torch.zeros(
+            len(self.joint_names), device=self.device, dtype=torch.float32
+        )
+
+    def reset(self) -> None:
+        self.previous_action.zero_()
+
+    def actions_for_observation(self, observation: Any) -> Any:
+        with torch.no_grad():
+            if self.model_format == "torchscript":
+                actions = self.model(observation)
+                if isinstance(actions, (tuple, list)):
+                    actions = actions[0]
+            else:
+                actions = self.model.deterministic(observation)
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        return torch.clamp(actions.to(self.device, dtype=torch.float32), -1.0, 1.0)
+
+    def predict(
+        self,
+        qpos: list[float],
+        images: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del images
+        values = dict(context or {})
+        if len(qpos) != len(self.joint_names):
+            raise ValueError(
+                f"expected {len(self.joint_names)} joint positions, got {len(qpos)}"
+            )
+        raw_limits = values.get("joint_limits")
+        limits = dict(raw_limits) if isinstance(raw_limits, dict) else {}
+        missing_limits = [name for name in self.joint_names if name not in limits]
+        if missing_limits:
+            raise ValueError("PPO observation is missing joint limits: " + ", ".join(missing_limits))
+        lower = torch.tensor(
+            [float(limits[name][0]) for name in self.joint_names],
+            device=self.device, dtype=torch.float32,
+        )
+        upper = torch.tensor(
+            [float(limits[name][1]) for name in self.joint_names],
+            device=self.device, dtype=torch.float32,
+        )
+        if not bool(torch.isfinite(lower).all() and torch.isfinite(upper).all()) or bool(
+            (lower >= upper).any()
+        ):
+            raise ValueError("PPO observation contains invalid joint limits")
+        q = torch.tensor(qpos, device=self.device, dtype=torch.float32)
+        raw_velocities = values.get("joint_velocities")
+        velocities = (
+            [float(raw_velocities[name]) for name in self.joint_names]
+            if isinstance(raw_velocities, dict)
+            else [float(value) for value in list(raw_velocities or [])]
+        )
+        if len(velocities) != len(self.joint_names):
+            raise ValueError("PPO observation must include ordered joint velocities")
+        target = [float(value) for value in list(values.get("target_m") or [])]
+        end_effector = [float(value) for value in list(values.get("end_effector_m") or [])]
+        if len(target) != 3 or len(end_effector) != 3:
+            raise ValueError("PPO observation requires target_m and end_effector_m xyz values")
+        normalized_q = torch.clamp((q - (lower + upper) * 0.5) / ((upper - lower) * 0.5), -1.0, 1.0)
+        qd = torch.tensor(velocities, device=self.device, dtype=torch.float32) * 0.05
+        delta = (
+            torch.tensor(target, device=self.device, dtype=torch.float32)
+            - torch.tensor(end_effector, device=self.device, dtype=torch.float32)
+        ) / 0.5
+        observation = torch.cat((normalized_q, qd, delta, self.previous_action)).unsqueeze(0)
+        normalized_action = self.actions_for_observation(observation)[0]
+        scale_rad = float(dict(self.contract.get("action") or {}).get("scale_rad") or 0.0)
+        desired = torch.clamp(q + normalized_action * scale_rad, lower, upper)
+        self.previous_action.copy_(normalized_action)
+        return {
+            "kind": "blacknode.policy-prediction", "schema_version": 1,
+            "joint_names": list(self.joint_names),
+            "action": desired.detach().cpu().tolist(),
+            "normalized_action": normalized_action.detach().cpu().tolist(),
+            "action_mode": "absolute_joint_position", "units": "radians",
+            "physical_motion_authorized": False,
+        }
+
+
 class PPOTrainingJob:
     def __init__(self, config: PPOTrainingConfig) -> None:
         self.config = config
@@ -126,6 +318,7 @@ class PPOTrainingJob:
             "running": False, "viewer_url": "", "environment_index": 0,
             "error": "",
         }
+        self.environment: Any | None = None
         self.logs: deque[str] = deque(maxlen=40)
 
     def start(self) -> None:
@@ -133,6 +326,18 @@ class PPOTrainingJob:
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def close_viewer(self) -> None:
+        environment = self.environment
+        if environment is not None:
+            close_preview = getattr(environment, "close_preview", None)
+            if callable(close_preview):
+                close_preview()
+            else:
+                environment.close()
+            self.environment = None
+        with self.lock:
+            self.preview = {**self.preview, "running": False, "viewer_url": ""}
 
     def _log(self, message: str) -> None:
         with self.lock:
@@ -142,6 +347,7 @@ class PPOTrainingJob:
         with self.lock:
             elapsed = max(0.0, ((self.ended_ns or time.time_ns()) - self.started_ns) / 1e9)
             running = self.thread.is_alive()
+            viewer_running = bool(self.preview.get("running"))
             return {
                 "kind": "blacknode.ppo-training-job",
                 "schema_version": 1,
@@ -166,6 +372,9 @@ class PPOTrainingJob:
                 "environment_count": int(self.config.environment.get("environment_count") or 0),
                 "viewer_url": str(self.preview.get("viewer_url") or ""),
                 "viewer": dict(self.preview),
+                "viewer_running": viewer_running,
+                "service_running": running or viewer_running,
+                "mode": "training",
                 "started_at": self.started_at,
                 "ended_at": self.ended_at,
                 "elapsed_seconds": elapsed,
@@ -389,15 +598,211 @@ class PPOTrainingJob:
             self._log(self.error)
         finally:
             if environment is not None:
-                last_preview = environment.preview_status()
-                environment.close()
-                self.preview = {**last_preview, "running": False}
+                if self.phase == "completed" and self.config.viewer_enabled:
+                    try:
+                        environment.render_preview({
+                            "update": self.update,
+                            "updates": self.config.updates,
+                            "reward": self.mean_reward or 0.0,
+                            "success": bool(self.success_rate and self.success_rate > 0.0),
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                    last_preview = environment.preview_status()
+                    if bool(last_preview.get("running")):
+                        release_batch = getattr(environment, "release_training_batch", None)
+                        if callable(release_batch):
+                            last_preview = dict(release_batch())
+                        self.environment = environment
+                        self.preview = last_preview
+                        self._log("training complete; final preview remains open")
+                    else:
+                        environment.close()
+                        self.preview = {**last_preview, "running": False}
+                else:
+                    last_preview = environment.preview_status()
+                    environment.close()
+                    self.preview = {**last_preview, "running": False, "viewer_url": ""}
             with self.lock:
                 self.ended_at = _now()
                 self.ended_ns = time.time_ns()
 
 
-_jobs: dict[str, PPOTrainingJob] = {}
+class PPOReplayJob:
+    """Managed deterministic checkpoint replay in a one-arm Newton environment."""
+
+    def __init__(self, config: PPOReplayConfig) -> None:
+        self.config = config
+        self.stop_event = threading.Event()
+        self.lock = threading.RLock()
+        self.thread = threading.Thread(
+            target=self._run, daemon=True, name=f"blacknode-ppo-replay-{config.run_id}"
+        )
+        self.phase = "starting_replay"
+        self.update = 0
+        self.replay_episode = 0
+        self.mean_reward: float | None = None
+        self.mean_distance_m: float | None = None
+        self.success_rate: float | None = None
+        self.error = ""
+        self.actual_device = ""
+        self.started_at = _now()
+        self.started_ns = time.time_ns()
+        self.ended_at = ""
+        self.ended_ns = 0
+        self.environment: Any | None = None
+        self.preview: dict[str, Any] = {
+            "running": False, "viewer_url": "", "environment_index": 0, "error": "",
+        }
+        self.logs: deque[str] = deque(maxlen=40)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def close_viewer(self) -> None:
+        environment = self.environment
+        if environment is not None:
+            close_preview = getattr(environment, "close_preview", None)
+            if callable(close_preview):
+                close_preview()
+            else:
+                environment.close()
+            self.environment = None
+        with self.lock:
+            self.preview = {**self.preview, "running": False, "viewer_url": ""}
+
+    def _log(self, message: str) -> None:
+        with self.lock:
+            self.logs.append(f"{time.strftime('%H:%M:%S')} {message}")
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            running = self.thread.is_alive()
+            viewer_running = bool(self.preview.get("running"))
+            elapsed = max(0.0, ((self.ended_ns or time.time_ns()) - self.started_ns) / 1e9)
+            return {
+                "kind": "blacknode.ppo-replay-job", "schema_version": 1,
+                "run_id": self.config.run_id, "mode": "replay",
+                "phase": "stopping" if running and self.stop_event.is_set() else self.phase,
+                "running": running, "service_running": running or viewer_running,
+                "viewer_running": viewer_running, "stop_requested": self.stop_event.is_set(),
+                "update": self.update, "updates": self.update, "progress": 1.0,
+                "simulation_steps": 0, "mean_reward": self.mean_reward,
+                "mean_distance_m": self.mean_distance_m, "success_rate": self.success_rate,
+                "policy_loss": None, "value_loss": None, "entropy": None,
+                "frames_per_second": None, "checkpoint": self.config.checkpoint_path,
+                "output_dir": str(Path(self.config.checkpoint_path).parent),
+                "device": self.actual_device or self.config.device,
+                "environment_count": 1, "replay_episode": self.replay_episode,
+                "replay_episodes": self.config.episodes,
+                "viewer_url": str(self.preview.get("viewer_url") or ""),
+                "viewer": dict(self.preview), "started_at": self.started_at,
+                "ended_at": self.ended_at, "elapsed_seconds": elapsed,
+                "error": self.error, "logs": list(self.logs),
+                "physical_motion_authorized": False,
+            }
+
+    def _run(self) -> None:
+        environment = None
+        try:
+            _require_torch()
+            checkpoint = Path(self.config.checkpoint_path).expanduser().resolve()
+            payload = _torch_load(checkpoint, torch.device("cpu"))
+            if payload.get("kind") != "blacknode.ppo-checkpoint":
+                raise ValueError("checkpoint is not a Blacknode PPO checkpoint")
+            spec = _validate_environment(dict(payload["environment"]))
+            spec["environment_count"] = 1
+            spec["seed"] = int(spec.get("seed") or 42) + 200_000
+            environment = _environment_class()(spec, device=self.config.device)
+            self.actual_device = str(environment.torch_device)
+            model_config = PPOModelConfig.from_dict(dict(payload["model_config"]))
+            model = PPOActorCritic(model_config).to(environment.torch_device)
+            model.load_state_dict(payload["model_state"])
+            model.eval()
+            self.update = int(payload.get("update") or 0)
+            self.preview = environment.start_preview({
+                "provider": self.config.viewer_provider,
+                "port": self.config.viewer_port,
+                "environment_index": 0,
+                "label": f"SO-ARM101 PPO Replay · update {self.update}",
+            })
+            self._log(f"checkpoint replay opened at {self.preview.get('viewer_url') or 'unknown URL'}")
+            with self.lock:
+                self.phase = "replaying"
+            rewards: list[float] = []
+            distances: list[float] = []
+            successes = 0
+            completed = 0
+            render_interval = 1.0 / max(1, self.config.viewer_fps)
+            next_render_at = 0.0
+            control_interval = 1.0 / max(1, int(spec.get("control_hz") or 30))
+            with torch.no_grad():
+                for episode in range(1, self.config.episodes + 1):
+                    if self.stop_event.is_set():
+                        break
+                    self.replay_episode = episode
+                    observation = environment.reset()
+                    for _ in range(int(spec.get("episode_steps") or 128)):
+                        if self.stop_event.is_set():
+                            break
+                        started = time.perf_counter()
+                        observation, reward, done, info = environment.step(
+                            model.deterministic(observation)
+                        )
+                        reward_value = float(reward[0].detach().cpu())
+                        distance_value = float(info["distance_m"][0].detach().cpu())
+                        success = bool(info["success"][0].item())
+                        rewards.append(reward_value)
+                        distances.append(distance_value)
+                        now = time.perf_counter()
+                        if now >= next_render_at:
+                            environment.render_preview({
+                                "update": self.update, "updates": self.update,
+                                "reward": reward_value, "success": success,
+                                "mode": "replay", "replay_episode": episode,
+                                "replay_episodes": self.config.episodes,
+                            })
+                            self.preview = environment.preview_status()
+                            next_render_at = now + render_interval
+                        if bool(done[0].item()):
+                            completed += 1
+                            successes += int(success)
+                            break
+                        remaining = control_interval - (time.perf_counter() - started)
+                        if remaining > 0:
+                            time.sleep(remaining)
+            with self.lock:
+                self.mean_reward = sum(rewards) / max(1, len(rewards))
+                self.mean_distance_m = sum(distances) / max(1, len(distances))
+                self.success_rate = successes / max(1, completed)
+                self.phase = "stopped" if self.stop_event.is_set() else "replay_completed"
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.phase = "failed"
+                self.error = f"{type(exc).__name__}: {exc}"
+            self._log(self.error)
+        finally:
+            if environment is not None:
+                last_preview = environment.preview_status()
+                if self.phase == "replay_completed" and bool(last_preview.get("running")):
+                    release_batch = getattr(environment, "release_training_batch", None)
+                    if callable(release_batch):
+                        last_preview = dict(release_batch())
+                    self.environment = environment
+                    self.preview = last_preview
+                    self._log("replay complete; final frame remains open")
+                else:
+                    environment.close()
+                    self.preview = {**last_preview, "running": False, "viewer_url": ""}
+            with self.lock:
+                self.ended_at = _now()
+                self.ended_ns = time.time_ns()
+
+
+_jobs: dict[str, PPOTrainingJob | PPOReplayJob] = {}
 _jobs_lock = threading.RLock()
 
 
@@ -407,9 +812,28 @@ def start_job(config: PPOTrainingConfig) -> dict[str, Any]:
         current = _jobs.get(config.run_id)
         if current and current.thread.is_alive():
             return current.status()
+        if current:
+            current.close_viewer()
         job = PPOTrainingJob(config)
         _jobs[config.run_id] = job
         job._log(f"initializing simulated environments (requested device: {config.device})")
+        job.start()
+        return job.status()
+
+
+def start_replay_job(config: PPOReplayConfig) -> dict[str, Any]:
+    checkpoint = Path(config.checkpoint_path).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise ValueError(f"checkpoint does not exist: {checkpoint}")
+    with _jobs_lock:
+        current = _jobs.get(config.run_id)
+        if current and current.thread.is_alive():
+            return current.status()
+        if current:
+            current.close_viewer()
+        job = PPOReplayJob(config)
+        _jobs[config.run_id] = job
+        job._log(f"loading checkpoint replay from {checkpoint.name}")
         job.start()
         return job.status()
 
@@ -420,6 +844,17 @@ def stop_job(run_id: str) -> dict[str, Any]:
     if job is None:
         raise ValueError(f"PPO run {run_id!r} was not found")
     job.stop()
+    return job.status()
+
+
+def close_job_viewer(run_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(run_id)
+    if job is None:
+        raise ValueError(f"PPO run {run_id!r} was not found")
+    if job.thread.is_alive():
+        raise ValueError("stop the active PPO job before closing its viewer")
+    job.close_viewer()
     return job.status()
 
 
@@ -436,6 +871,7 @@ def job_status(run_id: str) -> dict[str, Any]:
         "value_loss": None, "entropy": None, "frames_per_second": None,
         "checkpoint": "", "output_dir": "", "device": "", "error": "", "logs": [],
         "viewer_url": "", "viewer": {"running": False, "viewer_url": "", "error": ""},
+        "viewer_running": False, "service_running": False, "mode": "training",
         "physical_motion_authorized": False,
     }
 
@@ -446,25 +882,36 @@ def control_training_job(run_id: str, action: str) -> dict[str, Any]:
         status = job_status(run_id)
     elif normalized == "stop":
         status = stop_job(run_id)
+    elif normalized == "close-viewer":
+        status = close_job_viewer(run_id)
     else:
-        raise ValueError("PPOTraining direct control supports status or stop")
+        raise ValueError("PPOTraining direct control supports status, stop, or close-viewer")
     return node_outputs(status)
 
 
 def runtime_status() -> dict[str, Any]:
     with _jobs_lock:
-        statuses = [job.status() for job in _jobs.values() if job.thread.is_alive()]
+        statuses = [
+            status for job in _jobs.values()
+            if (status := job.status()).get("service_running")
+        ]
     return {"ok": True, "active": bool(statuses), "managed_runs": statuses,
-            "report": f"{len(statuses)} active PPO training job(s)"}
+            "report": f"{len(statuses)} active PPO training or replay service(s)"}
 
 
 def stop_runtime_services() -> dict[str, Any]:
     with _jobs_lock:
-        jobs = [job for job in _jobs.values() if job.thread.is_alive()]
+        jobs = [
+            job for job in _jobs.values()
+            if job.thread.is_alive() or bool(job.status().get("viewer_running"))
+        ]
     for job in jobs:
-        job.stop()
+        if job.thread.is_alive():
+            job.stop()
+        else:
+            job.close_viewer()
     return {"ok": True, "stopped": {"ppo_runs": len(jobs)},
-            "report": f"requested stop for {len(jobs)} PPO training job(s)"}
+            "report": f"requested stop for {len(jobs)} PPO training or replay service(s)"}
 
 
 def checkpoint_info(checkpoint_path: str | Path) -> dict[str, Any]:
@@ -503,9 +950,11 @@ def export_policy_artifact(checkpoint_path: str | Path, output_dir: str | Path, 
     }, temporary)
     temporary.replace(model_path)
     environment = dict(payload["environment"])
+    compatibility_contract = ppo_observation_contract(environment)
     manifest = {
         "kind": "blacknode.policy-artifact", "schema_version": 1,
         "policy_type": "ppo-so101-reach", "backend": "blacknode-native",
+        "model_format": "blacknode-ppo-state-dict",
         "created_at": _now(), "path": str(output), "model_file": model_path.name,
         "source_checkpoint": str(checkpoint), "step": int(payload.get("simulation_steps") or 0),
         "update": int(payload.get("update") or 0), "task": "reach",
@@ -514,11 +963,108 @@ def export_policy_artifact(checkpoint_path: str | Path, output_dir: str | Path, 
         "camera_names": [], "state_dim": int(environment["observation"]["dimension"]),
         "action_dim": int(environment["action"]["dimension"]),
         "model_config": dict(payload["model_config"]), "environment": environment,
+        "compatibility_contract": compatibility_contract,
+        "compatible_simulators": ["newton", "isaac-sim"],
         "metrics": dict(payload.get("metrics") or {}),
         "safety": {"simulation_only": True, "physical_motion_authorized": False},
     }
     _atomic_json(output / "manifest.json", manifest)
     return {**manifest, "model_path": str(model_path)}
+
+
+def import_torchscript_policy(
+    model_path: str | Path,
+    environment: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    overwrite: bool = False,
+    source: str = "isaac-sim",
+) -> dict[str, Any]:
+    """Package a compatible Isaac-trained TorchScript actor for Blacknode simulators."""
+    _require_torch()
+    source_model = Path(str(model_path or "").strip()).expanduser().resolve()
+    if not source_model.is_file():
+        raise ValueError(f"TorchScript policy does not exist: {source_model}")
+    spec = _validate_environment(environment)
+    contract = ppo_observation_contract(spec)
+    output = Path(output_dir).expanduser().resolve()
+    if output.exists() and any(output.iterdir()) and not overwrite:
+        raise FileExistsError(f"policy artifact directory is not empty: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    model = torch.jit.load(str(source_model), map_location="cpu")
+    model.eval()
+    observation_dim = int(dict(contract["observation"])["dimension"])
+    action_dim = int(dict(contract["action"])["dimension"])
+    with torch.no_grad():
+        result = model(torch.zeros((1, observation_dim), dtype=torch.float32))
+        if isinstance(result, (tuple, list)):
+            result = result[0]
+    result = torch.as_tensor(result)
+    if tuple(result.shape) != (1, action_dim):
+        raise ValueError(
+            f"TorchScript actor must map [1,{observation_dim}] to [1,{action_dim}], "
+            f"got {tuple(result.shape)}"
+        )
+    destination = output / "policy.pt"
+    temporary = destination.with_suffix(".pt.tmp")
+    shutil.copy2(source_model, temporary)
+    temporary.replace(destination)
+    manifest = {
+        "kind": "blacknode.policy-artifact", "schema_version": 1,
+        "policy_type": "ppo-so101-reach", "backend": "blacknode-native",
+        "model_format": "torchscript", "created_at": _now(),
+        "path": str(output), "model_file": destination.name,
+        "source": str(source or "isaac-sim"), "source_model": str(source_model),
+        "task": "reach", "robot_profile": str(spec.get("robot_profile") or "so_arm101"),
+        "action_mode": "bounded_joint_position_delta", "units": "normalized",
+        "joint_names": list(spec["joint_names"]), "camera_names": [],
+        "state_dim": observation_dim, "action_dim": action_dim,
+        "environment": dict(spec), "compatibility_contract": contract,
+        "compatible_simulators": ["newton", "isaac-sim"],
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    _atomic_json(output / "manifest.json", manifest)
+    return {**manifest, "model_path": str(destination)}
+
+
+def evaluate_policy_artifact(
+    artifact: str | Path | dict[str, Any],
+    device_name: str = "auto",
+    environment_count: int = 64,
+) -> dict[str, Any]:
+    """Evaluate a native or imported PPO artifact in Newton."""
+    policy = PPOPolicy(artifact, device_name)
+    spec = dict(policy.info["environment"])
+    spec["environment_count"] = max(1, min(1024, int(environment_count)))
+    spec["seed"] = int(spec.get("seed") or 42) + 100_000
+    environment = _environment_class()(spec, device=str(policy.device))
+    try:
+        observation = environment.observe()
+        completed = 0
+        successful = 0
+        distances: list[float] = []
+        rewards: list[float] = []
+        for _ in range(int(spec.get("episode_steps") or 128)):
+            actions = policy.actions_for_observation(observation)
+            observation, reward, done, info = environment.step(actions)
+            completed += int(done.sum().item())
+            successful += int((done & info["success"]).sum().item())
+            distances.append(float(info["distance_m"].mean().item()))
+            rewards.append(float(reward.mean().item()))
+        return {
+            "kind": "blacknode.ppo-evaluation", "schema_version": 1,
+            "artifact": str(policy.info["path"]),
+            "source": str(policy.info.get("source") or "blacknode"),
+            "environment_count": environment.environment_count,
+            "completed_episodes": completed, "successful_episodes": successful,
+            "success_rate": successful / max(1, completed),
+            "mean_distance_m": sum(distances) / max(1, len(distances)),
+            "mean_reward": sum(rewards) / max(1, len(rewards)),
+            "device": str(environment.torch_device), "simulation_only": True,
+            "physical_motion_authorized": False,
+        }
+    finally:
+        environment.close()
 
 
 def evaluate_checkpoint(
@@ -573,7 +1119,7 @@ def dashboard(status: dict[str, Any]) -> str:
     distance = status.get("mean_distance_m")
     success = status.get("success_rate")
     error_lines = textwrap.wrap(str(status.get("error") or ""), width=72, break_long_words=True) or [""]
-    color = "#22c55e" if phase == "COMPLETED" else "#ef4444" if phase == "FAILED" else "#8b5cf6"
+    color = "#22c55e" if phase in {"COMPLETED", "REPLAY_COMPLETED"} else "#ef4444" if phase == "FAILED" else "#8b5cf6"
     height = 210 + max(0, len(error_lines) - 1) * 18
     fill = int(472 * progress)
     distance_text = "—" if distance is None else f"{float(distance):.4f} m"
@@ -601,10 +1147,21 @@ def node_outputs(status: dict[str, Any]) -> dict[str, Any]:
         "update": int(status.get("update") or 0), "status": status,
         "dashboard": dashboard(status), "viewer": dict(status.get("viewer") or {}),
         "viewer_url": str(status.get("viewer_url") or ""),
+        "viewer_running": bool(status.get("viewer_running")),
+        "mode": str(status.get("mode") or "training"),
+        "replay_episode": int(status.get("replay_episode") or 0),
+        "replay_episodes": int(status.get("replay_episodes") or 0),
         "checkpoint": str(status.get("checkpoint") or ""),
         "report": (
-            f"SO-ARM101 PPO {phase}: update {int(status.get('update') or 0)}/"
-            f"{int(status.get('updates') or 0)}; physical motion disarmed"
+            f"SO-ARM101 PPO {phase}: "
+            + (
+                f"episode {int(status.get('replay_episode') or 0)}/"
+                f"{int(status.get('replay_episodes') or 0)}, checkpoint update "
+                f"{int(status.get('update') or 0)}"
+                if str(status.get("mode") or "training") == "replay"
+                else f"update {int(status.get('update') or 0)}/{int(status.get('updates') or 0)}"
+            )
+            + "; physical motion disarmed"
             + (f"; {status['error']}" if status.get("error") else "")
         ),
     }

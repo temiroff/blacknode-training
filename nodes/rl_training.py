@@ -110,7 +110,7 @@ def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
     ),
     inputs={
         "trigger": AnyPort,
-        "action": Enum(["start", "run", "status", "check", "stop"], default="start"),
+        "action": Enum(["start", "run", "replay", "status", "check", "stop"], default="start"),
         "environment": Dict(default={}),
         "run_id": Text(default="so101-reach-ppo"),
         "output_dir": Text(default=""),
@@ -131,18 +131,23 @@ def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
         "seed": Int(default=42),
         "resume": Bool(default=True),
         "viewer_enabled": Bool(default=True),
-        "viewer_provider": Enum(["viser"], default="viser"),
+        "viewer_provider": Enum(["viser", "ovrtx"], default="viser"),
         "viewer_port": Int(default=8091),
         "viewer_fps": Int(default=15),
         "viewer_environment_index": Int(default=0),
+        "replay_episodes": Int(default=3),
         "overwrite": Bool(default=False),
     },
     outputs={
         "ok": Bool, "running": Bool, "phase": Text, "update": Int,
         "status": Dict, "dashboard": Image, "viewer": Dict, "viewer_url": Text,
-        "checkpoint": Text, "report": Text,
+        "viewer_running": Bool, "mode": Text, "replay_episode": Int,
+        "replay_episodes": Int, "checkpoint": Text, "report": Text,
     },
-    primary_inputs=["trigger", "action", "environment", "output_dir", "overwrite"],
+    primary_inputs=[
+        "trigger", "action", "environment", "output_dir", "viewer_provider",
+        "replay_episodes", "overwrite",
+    ],
     primary_outputs=["dashboard", "viewer_url", "checkpoint", "report"],
 )
 def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
@@ -163,6 +168,19 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
                     "device": config.device,
                     "environment_count": int(config.environment["environment_count"]),
                 }
+            elif action == "replay":
+                checkpoints = sorted(output.glob("checkpoint-*.pt")) if output.exists() else []
+                if not checkpoints:
+                    raise ValueError(f"no PPO checkpoint is available to replay in {output}")
+                status = ppo_runtime.start_replay_job(ppo_runtime.PPOReplayConfig(
+                    run_id=run_id,
+                    checkpoint_path=str(checkpoints[-1]),
+                    device=config.device,
+                    episodes=max(1, min(100, int(ctx.get("replay_episodes") or 3))),
+                    viewer_provider=config.viewer_provider,
+                    viewer_port=config.viewer_port,
+                    viewer_fps=config.viewer_fps,
+                ))
             elif action in {"start", "run"}:
                 current = ppo_runtime.job_status(run_id)
                 if bool(current.get("running")):
@@ -200,7 +218,7 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
                 if action == "run":
                     status = _wait_for_training(run_id)
             else:
-                raise ValueError("action must be status, check, start, run, or stop")
+                raise ValueError("action must be status, check, start, run, replay, or stop")
         return ppo_runtime.node_outputs(status)
     except Exception as exc:  # noqa: BLE001
         if action == "run":
@@ -234,23 +252,42 @@ def ppo_checkpoint_inspect(ctx: dict[str, Any]) -> dict[str, Any]:
     description="Evaluate a PPO checkpoint deterministically on simulated SO-ARM101 arms; never commands hardware.",
     inputs={
         "trigger": AnyPort, "action": Enum(["evaluate", "check"], default="evaluate"),
-        "checkpoint_path": Text(default=""), "device": Enum(["auto", "cuda", "cpu"], default="auto"),
+        "checkpoint_path": Text(default=""), "artifact": Dict(default={}),
+        "device": Enum(["auto", "cuda", "cpu"], default="auto"),
         "environment_count": Int(default=64),
     },
     outputs={"ok": Bool, "evaluated": Bool, "metrics": Dict, "success_rate": Float, "report": Text},
-    primary_inputs=["trigger", "action", "checkpoint_path"], primary_outputs=["metrics", "report"],
+    primary_inputs=["trigger", "action", "checkpoint_path", "artifact"],
+    primary_outputs=["metrics", "report"],
 )
 def ppo_policy_evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
     try:
-        info = ppo_runtime.checkpoint_info(str(ctx.get("checkpoint_path") or ""))
+        artifact = dict(ctx.get("artifact") or {})
+        info = (
+            {"update": int(artifact.get("update") or 0), "path": str(artifact.get("path") or "")}
+            if artifact else
+            ppo_runtime.checkpoint_info(str(ctx.get("checkpoint_path") or ""))
+        )
         if str(ctx.get("action") or "evaluate").lower() == "check":
             return {"ok": True, "evaluated": False, "metrics": {}, "success_rate": 0.0,
-                    "report": f"PPO evaluation ready at update {info['update']}; choose action=evaluate"}
-        metrics = ppo_runtime.evaluate_checkpoint(
-            info["path"], str(ctx.get("device") or "auto"),
-            max(1, int(ctx.get("environment_count") or 64)),
+                    "report": (
+                        f"PPO artifact evaluation ready: {info['path']}; choose action=evaluate"
+                        if artifact else
+                        f"PPO evaluation ready at update {info['update']}; choose action=evaluate"
+                    )}
+        metrics = (
+            ppo_runtime.evaluate_policy_artifact(
+                artifact, str(ctx.get("device") or "auto"),
+                max(1, int(ctx.get("environment_count") or 64)),
+            )
+            if artifact else
+            ppo_runtime.evaluate_checkpoint(
+                info["path"], str(ctx.get("device") or "auto"),
+                max(1, int(ctx.get("environment_count") or 64)),
+            )
         )
-        evaluation_path = Path(info["path"]).parent / "evaluation.json"
+        evaluation_root = Path(str(artifact.get("path") or "")) if artifact else Path(info["path"]).parent
+        evaluation_path = evaluation_root / "evaluation.json"
         ppo_runtime._atomic_json(evaluation_path, metrics)
         metrics = {**metrics, "path": str(evaluation_path)}
         return {"ok": True, "evaluated": True, "metrics": metrics,
@@ -296,3 +333,55 @@ def ppo_policy_export(ctx: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "exported": False, "artifact": {}, "artifact_path": "",
                 "report": f"PPO policy export FAILED: {exc}"}
+
+
+@node(
+    name="PPOPolicyImport", component="reinforcement-learning", category=_CATEGORY,
+    description=(
+        "Package a compatible Isaac-trained TorchScript PPO actor for evaluation in "
+        "Newton and Isaac Sim. The artifact remains simulation-only."
+    ),
+    inputs={
+        "trigger": AnyPort, "action": Enum(["import", "check"], default="import"),
+        "model_path": Text(default=""), "environment": Dict(default={}),
+        "output_dir": Text(default=""), "source": Text(default="isaac-sim"),
+        "overwrite": Bool(default=False),
+    },
+    outputs={"ok": Bool, "imported": Bool, "artifact": Dict, "artifact_path": Text, "report": Text},
+    primary_inputs=["trigger", "action", "model_path", "environment", "output_dir", "overwrite"],
+    primary_outputs=["artifact", "artifact_path", "report"],
+)
+def ppo_policy_import(ctx: dict[str, Any]) -> dict[str, Any]:
+    try:
+        model_path = Path(str(ctx.get("model_path") or "").strip()).expanduser().resolve()
+        raw_output = str(ctx.get("output_dir") or "").strip()
+        output = (
+            Path(raw_output).expanduser().resolve()
+            if raw_output else model_path.parent / f"{model_path.stem}-blacknode-policy"
+        )
+        if str(ctx.get("action") or "import").lower() == "check":
+            return {
+                "ok": model_path.is_file(), "imported": False, "artifact": {},
+                "artifact_path": str(output),
+                "report": (
+                    f"compatible TorchScript PPO import ready: {model_path}"
+                    if model_path.is_file() else f"TorchScript policy does not exist: {model_path}"
+                ),
+            }
+        artifact = ppo_runtime.import_torchscript_policy(
+            model_path, dict(ctx.get("environment") or {}), output,
+            overwrite=bool(ctx.get("overwrite", False)),
+            source=str(ctx.get("source") or "isaac-sim"),
+        )
+        return {
+            "ok": True, "imported": True, "artifact": artifact,
+            "artifact_path": str(artifact["path"]),
+            "report": (
+                f"compatible PPO policy imported from {artifact['source']}: {artifact['path']}"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False, "imported": False, "artifact": {}, "artifact_path": "",
+            "report": f"PPO policy import FAILED: {exc}",
+        }

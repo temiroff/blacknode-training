@@ -1,0 +1,67 @@
+{
+  "kind": "blacknode.workflow",
+  "schema_version": 1,
+  "name": "SO-ARM101 Isaac PPO Import",
+  "saved_at": "2026-08-09T00:00:00Z",
+  "entrypoint": {"node_id": "evaluate", "port": "metrics"},
+  "metadata": {
+    "template": true,
+    "description": "Package an Isaac-trained TorchScript actor under the shared SO-ARM101 reach contract, then evaluate it in a disarmed Newton environment.",
+    "color": "#8b5cf6",
+    "required_packages": ["blacknode-newton", "blacknode-training"],
+    "required_components": ["blacknode-newton/runtime", "blacknode-training/reinforcement-learning"]
+  },
+  "node_meta": {
+    "model_path": {
+      "id": "model_path", "type": "Text", "pos": [80, 70],
+      "params": {"value": "C:\\path\\to\\isaac_actor.pt"},
+      "inputs": [], "outputs": ["value"], "input_types": {},
+      "output_types": {"value": "Text"}, "input_defaults": {}
+    },
+    "output_dir": {
+      "id": "output_dir", "type": "Text", "pos": [80, 250],
+      "params": {"value": ""},
+      "inputs": [], "outputs": ["value"], "input_types": {},
+      "output_types": {"value": "Text"}, "input_defaults": {}
+    },
+    "task": {
+      "id": "task", "type": "SO101ReachTask", "pos": [80, 430],
+      "params": {"asset_path": "package://blacknode-newton/assets/so101_robot.usd", "environment_count": 64, "episode_steps": 128, "simulation_hz": 120, "control_hz": 30, "action_scale_deg": 3.0, "success_tolerance_m": 0.025, "seed": 42},
+      "inputs": ["trigger", "asset_path", "environment_count", "episode_steps", "simulation_hz", "control_hz", "action_scale_deg", "success_tolerance_m", "seed"],
+      "outputs": ["environment", "joint_names", "observation_dim", "action_dim", "report"],
+      "input_types": {"trigger": "Any", "asset_path": "Text", "environment_count": "Int", "episode_steps": "Int", "simulation_hz": "Int", "control_hz": "Int", "action_scale_deg": "Float", "success_tolerance_m": "Float", "seed": "Int"},
+      "output_types": {"environment": "Dict", "joint_names": "List", "observation_dim": "Int", "action_dim": "Int", "report": "Text"},
+      "input_defaults": {"asset_path": "package://blacknode-newton/assets/so101_robot.usd", "environment_count": 512, "episode_steps": 128, "simulation_hz": 120, "control_hz": 30, "action_scale_deg": 3.0, "success_tolerance_m": 0.025, "seed": 42}
+    },
+    "import": {
+      "id": "import", "type": "PPOPolicyImport", "pos": [510, 160],
+      "params": {"action": "check", "model_path": "", "environment": {}, "output_dir": "", "source": "isaac-sim", "overwrite": false},
+      "inputs": ["trigger", "action", "model_path", "environment", "output_dir", "source", "overwrite"],
+      "outputs": ["ok", "imported", "artifact", "artifact_path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "model_path": "Text", "environment": "Dict", "output_dir": "Text", "source": "Text", "overwrite": "Bool"},
+      "output_types": {"ok": "Bool", "imported": "Bool", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "import", "model_path": "", "environment": {}, "output_dir": "", "source": "isaac-sim", "overwrite": false},
+      "input_choices": {"action": ["import", "check"]},
+      "promoted_inputs": ["action", "model_path", "output_dir", "overwrite"],
+      "promoted_outputs": ["artifact", "artifact_path", "report"]
+    },
+    "evaluate": {
+      "id": "evaluate", "type": "PPOPolicyEvaluate", "pos": [940, 230],
+      "params": {"action": "check", "checkpoint_path": "", "artifact": {}, "device": "auto", "environment_count": 64},
+      "inputs": ["trigger", "action", "checkpoint_path", "artifact", "device", "environment_count"],
+      "outputs": ["ok", "evaluated", "metrics", "success_rate", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "artifact": "Dict", "device": "Text", "environment_count": "Int"},
+      "output_types": {"ok": "Bool", "evaluated": "Bool", "metrics": "Dict", "success_rate": "Float", "report": "Text"},
+      "input_defaults": {"action": "evaluate", "checkpoint_path": "", "artifact": {}, "device": "auto", "environment_count": 64},
+      "input_choices": {"action": ["evaluate", "check"], "device": ["auto", "cuda", "cpu"]},
+      "promoted_inputs": ["action", "artifact", "environment_count"],
+      "promoted_outputs": ["metrics", "report"]
+    }
+  },
+  "edges": [
+    {"from": "model_path", "from_port": "value", "to": "import", "to_port": "model_path"},
+    {"from": "output_dir", "from_port": "value", "to": "import", "to_port": "output_dir"},
+    {"from": "task", "from_port": "environment", "to": "import", "to_port": "environment"},
+    {"from": "import", "from_port": "artifact", "to": "evaluate", "to_port": "artifact"}
+  ]
+}
