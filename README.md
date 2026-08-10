@@ -35,13 +35,36 @@ emits progress and reward metrics, evaluates the final checkpoint, and exports
 `evaluation.json` plus `policy.pt`. The ordinary PPO template keeps
 `action=start` for interactive editor control.
 
-With `viewer_enabled=true`, training starts a read-only Viser preview and
-Blacknode opens it in the simulation pane. The preview copies one selected arm
-into a separate one-articulation render model at up to `viewer_fps` (15 by
-default), so the complete environment batch remains dedicated to learning. Use
-the **Environment index** control inside the viewer to inspect another arm. The
-green sphere is the reach target and the orange line is the end-effector trail.
-The preview contains no joint-command or hardware-arm controls.
+With `viewer_enabled=true`, training starts a read-only preview and Blacknode
+opens it in the simulation pane. Select `viser` for the lightweight interactive
+training view, including the reach target, trail, metrics, and environment
+selector. Select `ovrtx` for the RTX-rendered USD view after enabling
+`blacknode-newton/viewer-ovrtx` in **Packages** and installing its prerequisites.
+Both providers copy one selected arm into a separate one-articulation render
+model at up to `viewer_fps` (15 by default), so the complete environment batch
+remains dedicated to learning. Neither preview contains joint-command or
+hardware-arm controls.
+
+When training completes, Blacknode releases the replicated training batch and
+keeps the final one-arm preview open. Press **Replay checkpoint** on
+`PPOTraining` to run the latest checkpoint deterministically for
+`replay_episodes` at visible control speed. Replay uses one simulated arm,
+leaves its final frame open, and closes only through **Close viewer**, **Stop
+all**, or server shutdown.
+
+`PPOPolicyExport` now records a simulator-neutral
+`blacknode.ppo-compatibility-contract`. The exported SO-ARM101 reach policy can
+be evaluated in Newton or through Blacknode's Isaac Sim bridge. The contract
+preserves ordered joint names, the 21 semantic observation fields, normalized
+six-joint delta actions, task scale, and its simulation-only safety state.
+
+For the reverse path, open **SO-ARM101 Isaac PPO Import**. Export the
+deterministic Isaac actor as TorchScript with shape `[batch,21] -> [batch,6]`,
+connect the matching `SO101ReachTask` environment, and run `PPOPolicyImport`.
+The importer validates the tensor interface and creates a normal Blacknode PPO
+artifact. Connect that artifact to `PPOPolicyEvaluate` to evaluate it in
+Newton. Arbitrary Isaac training checkpoints require an actor export matching
+this observation and action contract.
 
 ## Workflow
 

@@ -435,7 +435,7 @@ def runtime_status() -> dict[str, Any]:
         "ok": True,
         "active": bool(managed_runs),
         "managed_runs": managed_runs,
-        "report": f"{len(managed_runs)} active policy training job(s)",
+        "report": f"{len(managed_runs)} active policy training or replay service(s)",
     }
 
 
@@ -450,7 +450,7 @@ def stop_runtime_services() -> dict[str, Any]:
     return {
         "ok": True,
         "stopped": {"managed_runs": len(jobs), "ppo_runs": ppo_count},
-        "report": f"requested stop for {len(jobs) + ppo_count} policy training job(s)",
+        "report": f"requested stop for {len(jobs) + ppo_count} policy training or replay service(s)",
     }
 
 
@@ -582,7 +582,13 @@ class ACTPolicy:
         self.model.eval()
         self.statistics = dict(self.info["statistics"])
 
-    def predict(self, qpos: list[float], images: dict[str, Any]) -> dict[str, Any]:
+    def predict(
+        self,
+        qpos: list[float],
+        images: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del context
         assert torch is not None and np is not None
         if len(qpos) != int(self.info["state_dim"]):
             raise ValueError(f"expected {self.info['state_dim']} joint values, got {len(qpos)}")
