@@ -576,6 +576,25 @@ def test_policy_replay_contract_without_loading_real_model(tmp_path: Path, monke
     assert replayed["metrics"]["mean_absolute_error"] == pytest.approx(0.1)
 
 
+def test_openpi_remote_policy_artifact_loads_without_a_local_model(tmp_path: Path):
+    manifest = {
+        "kind": "blacknode.policy-artifact", "schema_version": 1,
+        "policy_type": "openpi-pi05", "backend": "openpi-remote",
+        "path": str(tmp_path), "action_mode": "absolute_joint_position",
+        "units": "radians", "joint_names": ["shoulder", "gripper"],
+        "camera_names": ["front"], "physical_motion_authorized": False,
+        "server": {
+            "host": "127.0.0.1", "port": 8000,
+            "prompt": "Pick up the cube.", "action_horizon": 50,
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = _NODE_REGISTRY["PolicyArtifactLoad"]({"artifact_path": str(tmp_path)})
+    assert loaded["ok"]
+    assert loaded["policy_type"] == "openpi-pi05"
+    assert loaded["artifact"]["model_path"] == ""
+
+
 @pytest.mark.skipif(h5py is None or torch is None, reason="h5py and torch are installed by package setup")
 def test_dataset_training_checkpoint_and_preview(tmp_path: Path):
     _write_episode(tmp_path, 0)
