@@ -11,9 +11,27 @@
 | `checkpoints` | Inspect checkpoint schema, metrics, and configuration |
 | `policy-preview` | Preview and replay predictions on recorded episodes |
 | `policy-artifacts` | Export and load inference artifacts |
-| `reinforcement-learning` | Train, stop, resume, evaluate, and export PPO policies for vectorized Newton environments |
+| `reinforcement-learning` | Train, stop, resume, evaluate, export, and qualify PPO policies for extension-owned vectorized environments |
 
 All components are optional so normal robot runtimes do not install the training stack.
+
+### Provider-neutral reinforcement learning
+
+`PPOTraining` accepts a `blacknode.rl-environment` from any loaded extension
+package. The environment declares its provider factory, tensor dimensions,
+semantic observation fields, action mapping, timing, domain randomization, and
+simulation-only safety state. Training no longer depends on a particular
+simulator package.
+
+`PPOPolicyExport` writes a portable TorchScript actor by default and fingerprints
+the model plus compatibility contract. Connect the exported artifact and one or
+more `PPOPolicyEvaluate` results to `PPOPolicyQualify`. The qualification binds
+explicit success, episode-count, distance, and scenario thresholds to the exact
+artifact while leaving physical motion unauthorized. Physical approval belongs
+to `blacknode-motion` and remains bound to a calibrated robot and safety gate.
+
+See the core [sim-to-real lifecycle guide](../../docs/sim-to-real-policy-lifecycle.md)
+for the environment contract and deployment flow.
 
 ### SO-ARM101 reinforcement learning
 
@@ -81,8 +99,8 @@ Training splits by episode and computes normalization from training episodes onl
 
 This package performs offline training, simulated reinforcement learning, and
 prediction evaluation. It never commands hardware. PPO checkpoints and
-artifacts explicitly retain `physical_motion_authorized=false`; a future
-hardware evaluation path must add a separately armed safety controller. Treat
+artifacts explicitly retain `physical_motion_authorized=false`; deployment uses
+a separate qualification-bound authorization and armed safety controller. Treat
 checkpoints as trusted executable data and review predictions before connecting
 an artifact to a motion controller.
 

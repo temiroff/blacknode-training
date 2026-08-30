@@ -548,12 +548,15 @@ def policy_artifact_info(artifact: str | Path | dict[str, Any]) -> dict[str, Any
             raise ValueError(f"policy manifest does not exist: {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         root = manifest_path.parent
-    if manifest.get("kind") != "blacknode.policy-artifact" or int(manifest.get("schema_version") or 0) != 1:
+    if manifest.get("kind") != "blacknode.policy-artifact" or int(manifest.get("schema_version") or 0) not in {1, 2}:
         raise ValueError("unsupported policy artifact manifest")
     policy_type = str(manifest.get("policy_type") or "")
     backend = str(manifest.get("backend") or "")
     openpi_remote = backend == "openpi-remote" and policy_type == "openpi-pi05"
-    if not openpi_remote and (backend != "blacknode-native" or policy_type not in {"act", "ppo-so101-reach"}):
+    if not openpi_remote and (
+        backend != "blacknode-native"
+        or policy_type not in {"act", "ppo-so101-reach", "ppo-continuous-control-v1"}
+    ):
         raise ValueError("unsupported Blacknode-native policy artifact")
     if openpi_remote:
         server = manifest.get("server") if isinstance(manifest.get("server"), dict) else {}
@@ -564,7 +567,7 @@ def policy_artifact_info(artifact: str | Path | dict[str, Any]) -> dict[str, Any
         if not list(manifest.get("joint_names") or []) or not list(manifest.get("camera_names") or []):
             raise ValueError("OpenPI remote artifact must declare joints and cameras")
         return {**manifest, "path": str(root), "model_path": ""}
-    if policy_type == "ppo-so101-reach":
+    if policy_type in {"ppo-so101-reach", "ppo-continuous-control-v1"}:
         safety = manifest.get("safety") if isinstance(manifest.get("safety"), dict) else {}
         if safety.get("simulation_only") is not True or safety.get("physical_motion_authorized") is not False:
             raise ValueError("PPO artifact is missing its simulation-only safety contract")

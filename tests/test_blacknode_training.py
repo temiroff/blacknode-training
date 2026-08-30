@@ -72,7 +72,7 @@ EXPECTED = {
     "TrainingDatasetCheck", "ACTTraining", "ACTCheckpointInspect", "ACTPolicyPreview",
     "ACTPolicyExport", "PolicyArtifactLoad", "ACTPolicyReplay",
     "PPOTraining", "PPOCheckpointInspect", "PPOPolicyEvaluate", "PPOPolicyExport",
-    "PPOPolicyImport",
+    "PPOPolicyImport", "PPOPolicyQualify",
     "OpenPIFineTune",
 }
 
@@ -261,6 +261,70 @@ def test_ppo_model_shape_and_disarmed_environment_check():
     checked = _NODE_REGISTRY["PPOTraining"]({"action": "check", "environment": unsafe})
     assert not checked["ok"]
     assert "simulation-only" in checked["report"]
+
+
+@pytest.mark.skipif(torch is None, reason="torch is installed by package setup")
+def test_generic_environment_contract_exports_portable_and_qualifies(tmp_path: Path):
+    environment = {
+        "kind": "blacknode.rl-environment", "schema_version": 2,
+        "provider": {
+            "package": "blacknode-example-sim", "component": "runtime",
+            "environment_type": "example-balance-v1",
+            "factory": "blacknode.pkg.blacknode_example_sim.rl:BalanceEnvironment",
+        },
+        "task": "balance", "robot_profile": "example_bot",
+        "joint_names": ["left", "right"], "environment_count": 32,
+        "episode_steps": 64, "simulation_hz": 200, "control_hz": 50,
+        "observation": {
+            "dimension": 6,
+            "fields": [
+                {"name": "joint_position", "source": "joint_positions_rad", "size": 2},
+                {"name": "joint_velocity", "source": "joint_velocities_rad_s", "size": 2},
+                {"name": "previous_action", "source": "previous_action", "size": 2},
+            ],
+        },
+        "action": {
+            "dimension": 2, "type": "bounded_joint_position_delta",
+            "minimum": -1.0, "maximum": 1.0, "scale_rad": 0.05,
+            "units": "normalized",
+        },
+        "domain_randomization": {"mass_scale": [0.8, 1.2]},
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    contract = ppo_runtime.ppo_observation_contract(environment)
+    assert contract["environment_type"] == "example-balance-v1"
+    assert contract["observation"]["dimension"] == 6
+    assert contract["domain_randomization"] == {"mass_scale": [0.8, 1.2]}
+
+    config = PPOModelConfig(observation_dim=6, action_dim=2, hidden_dim=32)
+    model = PPOActorCritic(config)
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save({
+        "kind": "blacknode.ppo-checkpoint", "schema_version": 1,
+        "update": 5, "simulation_steps": 1000,
+        "model_config": config.to_dict(), "model_state": model.state_dict(),
+        "environment": environment, "metrics": {"success_rate": 0.9},
+    }, checkpoint)
+    artifact = ppo_runtime.export_policy_artifact(checkpoint, tmp_path / "artifact")
+    assert artifact["policy_type"] == "ppo-continuous-control-v1"
+    assert artifact["model_format"] == "torchscript"
+    assert len(artifact["artifact_digest"]) == 64
+    assert ppo_runtime.PPOPolicy(artifact, "cpu").actions_for_observation(
+        torch.zeros((1, 6), dtype=torch.float32)
+    ).shape == (1, 2)
+
+    evaluation = {
+        "kind": "blacknode.ppo-evaluation", "artifact_digest": artifact["artifact_digest"],
+        "environment_count": 64, "completed_episodes": 80,
+        "success_rate": 0.9, "mean_distance_m": 0.02, "mean_reward": 1.5,
+    }
+    qualification = ppo_runtime.qualify_policy_artifact(
+        artifact, [evaluation], minimum_success_rate=0.8,
+        minimum_completed_episodes=64, maximum_mean_distance_m=0.05,
+    )
+    assert qualification["passed"]
+    assert qualification["safety"]["physical_motion_authorized"] is False
+    assert (tmp_path / "artifact" / "qualification.json").is_file()
 
 
 def test_ppo_run_waits_for_completion_and_emits_cloud_telemetry(
@@ -523,6 +587,17 @@ def test_so101_ppo_template_validates_and_stays_simulation_only():
     assert cloud_workflow["entrypoint"] == {"node_id": "out", "port": "value"}
     assert cloud_workflow["node_meta"]["training"]["params"]["action"] == "run"
     assert cloud_workflow["node_meta"]["training"]["params"]["viewer_enabled"] is False
+    assert cloud_workflow["node_meta"]["export"]["params"]["model_format"] == "torchscript"
+    assert cloud_workflow["node_meta"]["qualify"]["params"]["action"] == "qualify"
+    assert cloud_workflow["metadata"]["cloud"]["artifact_outputs"][-1] == "qualification.json"
+    assert {
+        ("export", "artifact", "qualify", "artifact"),
+        ("evaluate", "metrics", "qualify", "evaluation"),
+        ("qualify", "qualification", "out", "value"),
+    } <= {
+        (edge["from"], edge["from_port"], edge["to"], edge["to_port"])
+        for edge in cloud_workflow["edges"]
+    }
     assert "blacknode-newton/viewer-viser" not in cloud_workflow["metadata"]["required_components"]
 
     import_path = path.with_name("so101-ppo-isaac-import.json")

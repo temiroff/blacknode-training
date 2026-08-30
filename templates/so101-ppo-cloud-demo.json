@@ -5,11 +5,11 @@
   "entrypoint": {"node_id": "out", "port": "value"},
   "metadata": {
     "template": true,
-    "description": "Train, evaluate, and export a simulation-only SO-ARM101 PPO policy on replicated Newton and Warp environments.",
+    "description": "Train, evaluate, export, and qualify a portable SO-ARM101 PPO policy on replicated Newton and Warp environments.",
     "color": "#76b900",
     "required_packages": ["blacknode-newton", "blacknode-training"],
     "required_components": ["blacknode-newton/runtime", "blacknode-training/reinforcement-learning"],
-    "cloud": {"gpu_class": "l40s", "artifact_outputs": ["checkpoints", "evaluation.json", "policy.pt"]},
+    "cloud": {"gpu_class": "l40s", "artifact_outputs": ["checkpoints", "evaluation.json", "policy.pt", "qualification.json"]},
     "safety": {"simulation_only": true, "physical_motion_authorized": false}
   },
   "node_meta": {
@@ -46,13 +46,23 @@
       "input_defaults": {"action": "evaluate", "checkpoint_path": "", "artifact": {}, "device": "auto", "environment_count": 128}, "input_choices": {"action": ["evaluate", "check"], "device": ["auto", "cuda", "cpu"]}
     },
     "export": {
-      "id": "export", "type": "PPOPolicyExport", "pos": [1270, 220], "params": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": true},
-      "inputs": ["trigger", "action", "checkpoint_path", "output_dir", "overwrite"], "outputs": ["ok", "exported", "artifact", "artifact_path", "report"],
-      "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "output_dir": "Text", "overwrite": "Bool"}, "output_types": {"ok": "Bool", "exported": "Bool", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
-      "input_defaults": {"action": "export", "checkpoint_path": "", "output_dir": "", "overwrite": true}, "input_choices": {"action": ["export", "check"]}
+      "id": "export", "type": "PPOPolicyExport", "pos": [1270, 160], "params": {"action": "export", "checkpoint_path": "", "output_dir": "", "model_format": "torchscript", "overwrite": true},
+      "inputs": ["trigger", "action", "checkpoint_path", "output_dir", "model_format", "overwrite"], "outputs": ["ok", "exported", "artifact", "artifact_path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "checkpoint_path": "Text", "output_dir": "Text", "model_format": "Text", "overwrite": "Bool"}, "output_types": {"ok": "Bool", "exported": "Bool", "artifact": "Dict", "artifact_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "export", "checkpoint_path": "", "output_dir": "", "model_format": "torchscript", "overwrite": true}, "input_choices": {"action": ["export", "check"], "model_format": ["torchscript", "state_dict"]}
+    },
+    "qualify": {
+      "id": "qualify", "type": "PPOPolicyQualify", "pos": [1610, 220],
+      "params": {"action": "qualify", "artifact": {}, "evaluation": {}, "evaluations": [], "minimum_success_rate": 0.8, "minimum_completed_episodes": 64, "maximum_mean_distance_m": 0.05, "minimum_scenarios": 1},
+      "inputs": ["trigger", "action", "artifact", "evaluation", "evaluations", "minimum_success_rate", "minimum_completed_episodes", "maximum_mean_distance_m", "minimum_scenarios"],
+      "outputs": ["ok", "passed", "qualification", "qualification_path", "report"],
+      "input_types": {"trigger": "Any", "action": "Text", "artifact": "Dict", "evaluation": "Dict", "evaluations": "List", "minimum_success_rate": "Float", "minimum_completed_episodes": "Int", "maximum_mean_distance_m": "Float", "minimum_scenarios": "Int"},
+      "output_types": {"ok": "Bool", "passed": "Bool", "qualification": "Dict", "qualification_path": "Text", "report": "Text"},
+      "input_defaults": {"action": "qualify", "artifact": {}, "evaluation": {}, "evaluations": [], "minimum_success_rate": 0.8, "minimum_completed_episodes": 64, "maximum_mean_distance_m": 0.05, "minimum_scenarios": 1},
+      "input_choices": {"action": ["qualify", "check"]}
     },
     "out": {
-      "id": "out", "type": "Output", "pos": [1650, 220], "params": {}, "inputs": ["value"], "outputs": [], "input_types": {"value": "Any"}, "output_types": {}, "input_defaults": {}
+      "id": "out", "type": "Output", "pos": [1980, 220], "params": {}, "inputs": ["value"], "outputs": [], "input_types": {"value": "Any"}, "output_types": {}, "input_defaults": {}
     }
   },
   "edges": [
@@ -62,6 +72,8 @@
     {"from": "checkpoint", "from_port": "report", "to": "evaluate", "to_port": "trigger"},
     {"from": "training", "from_port": "checkpoint", "to": "export", "to_port": "checkpoint_path"},
     {"from": "evaluate", "from_port": "metrics", "to": "export", "to_port": "trigger"},
-    {"from": "export", "from_port": "artifact", "to": "out", "to_port": "value"}
+    {"from": "export", "from_port": "artifact", "to": "qualify", "to_port": "artifact"},
+    {"from": "evaluate", "from_port": "metrics", "to": "qualify", "to_port": "evaluation"},
+    {"from": "qualify", "from_port": "qualification", "to": "out", "to_port": "value"}
   ]
 }

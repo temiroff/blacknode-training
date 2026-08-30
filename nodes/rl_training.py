@@ -1,4 +1,4 @@
-"""Blacknode nodes for managed SO-ARM101 reinforcement learning."""
+"""Blacknode nodes for managed provider-neutral reinforcement learning."""
 from __future__ import annotations
 
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from blacknode.node import Any as AnyPort
-from blacknode.node import Bool, Dict, Enum, Float, Image, Int, Text, node
+from blacknode.node import Bool, Dict, Enum, Float, Image, Int, List, Text, node
 
 from . import ppo_runtime
 
@@ -60,7 +60,7 @@ def _run_id(value: Any) -> str:
 
 
 def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
-    run_id = _run_id(ctx.get("run_id") or "so101-reach-ppo")
+    run_id = _run_id(ctx.get("run_id") or "ppo-training")
     environment = ppo_runtime._validate_environment(dict(ctx.get("environment") or {}))
     raw_output = str(ctx.get("output_dir") or "").strip()
     output = (
@@ -105,14 +105,14 @@ def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
 @node(
     name="PPOTraining", component="reinforcement-learning", live=True, category=_CATEGORY,
     description=(
-        "Train a PPO policy on replicated SO-ARM101 Newton/Warp simulations. "
+        "Train a PPO policy on replicated environments supplied by a simulator extension. "
         "The physical robot remains disarmed and is never connected by this node."
     ),
     inputs={
         "trigger": AnyPort,
         "action": Enum(["start", "run", "replay", "status", "check", "stop"], default="start"),
         "environment": Dict(default={}),
-        "run_id": Text(default="so101-reach-ppo"),
+        "run_id": Text(default="ppo-training"),
         "output_dir": Text(default=""),
         "device": Enum(["auto", "cuda", "cpu"], default="auto"),
         "updates": Int(default=500),
@@ -153,7 +153,7 @@ def _config(ctx: dict[str, Any]) -> ppo_runtime.PPOTrainingConfig:
 def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
     action = str(ctx.get("action") or "start").lower()
     try:
-        run_id = _run_id(ctx.get("run_id") or "so101-reach-ppo")
+        run_id = _run_id(ctx.get("run_id") or "ppo-training")
         if action == "status":
             status = ppo_runtime.job_status(run_id)
         elif action == "stop":
@@ -224,7 +224,7 @@ def ppo_training(ctx: dict[str, Any]) -> dict[str, Any]:
         if action == "run":
             raise
         status = {
-            **ppo_runtime.job_status(str(ctx.get("run_id") or "so101-reach-ppo")),
+            **ppo_runtime.job_status(str(ctx.get("run_id") or "ppo-training")),
             "phase": "failed", "error": str(exc),
         }
         return ppo_runtime.node_outputs(status)
@@ -303,10 +303,11 @@ def ppo_policy_evaluate(ctx: dict[str, Any]) -> dict[str, Any]:
 
 @node(
     name="PPOPolicyExport", component="reinforcement-learning", category=_CATEGORY,
-    description="Export a PPO checkpoint as a simulation-only SO-ARM101 policy artifact.",
+    description="Export a PPO checkpoint as a portable, simulation-only continuous-control policy artifact.",
     inputs={
         "trigger": AnyPort, "action": Enum(["export", "check"], default="export"),
         "checkpoint_path": Text(default=""), "output_dir": Text(default=""),
+        "model_format": Enum(["torchscript", "state_dict"], default="torchscript"),
         "overwrite": Bool(default=False),
     },
     outputs={"ok": Bool, "exported": Bool, "artifact": Dict, "artifact_path": Text, "report": Text},
@@ -325,7 +326,8 @@ def ppo_policy_export(ctx: dict[str, Any]) -> dict[str, Any]:
             return {"ok": True, "exported": False, "artifact": {}, "artifact_path": str(output),
                     "report": f"PPO export ready at update {info['update']}; choose action=export"}
         artifact = ppo_runtime.export_policy_artifact(
-            info["path"], output, overwrite=bool(ctx.get("overwrite", False))
+            info["path"], output, overwrite=bool(ctx.get("overwrite", False)),
+            model_format=str(ctx.get("model_format") or "torchscript"),
         )
         return {"ok": True, "exported": True, "artifact": artifact,
                 "artifact_path": str(artifact["path"]),
@@ -383,5 +385,61 @@ def ppo_policy_import(ctx: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {
             "ok": False, "imported": False, "artifact": {}, "artifact_path": "",
-            "report": f"PPO policy import FAILED: {exc}",
+                "report": f"PPO policy import FAILED: {exc}",
+        }
+
+
+@node(
+    name="PPOPolicyQualify", component="reinforcement-learning", category=_CATEGORY,
+    description=(
+        "Bind simulator evaluation evidence and pass/fail thresholds to one immutable "
+        "PPO artifact. Qualification never authorizes physical motion."
+    ),
+    inputs={
+        "trigger": AnyPort, "action": Enum(["qualify", "check"], default="qualify"),
+        "artifact": Dict(default={}), "evaluation": Dict(default={}),
+        "evaluations": List(default=[]),
+        "minimum_success_rate": Float(default=0.8),
+        "minimum_completed_episodes": Int(default=64),
+        "maximum_mean_distance_m": Float(default=0.05),
+        "minimum_scenarios": Int(default=1),
+    },
+    outputs={
+        "ok": Bool, "passed": Bool, "qualification": Dict,
+        "qualification_path": Text, "report": Text,
+    },
+    primary_inputs=["trigger", "artifact", "evaluation", "evaluations"],
+    primary_outputs=["qualification", "report"],
+)
+def ppo_policy_qualify(ctx: dict[str, Any]) -> dict[str, Any]:
+    try:
+        artifact = dict(ctx.get("artifact") or {})
+        digest = ppo_runtime.policy_artifact_digest(artifact)
+        if str(ctx.get("action") or "qualify").lower() == "check":
+            return {
+                "ok": True, "passed": False, "qualification": {},
+                "qualification_path": "",
+                "report": f"PPO qualification ready for artifact {digest[:12]}; choose action=qualify",
+            }
+        evaluations = list(ctx.get("evaluations") or [])
+        if isinstance(ctx.get("evaluation"), dict) and ctx.get("evaluation"):
+            evaluations.insert(0, dict(ctx["evaluation"]))
+        qualification = ppo_runtime.qualify_policy_artifact(
+            artifact, evaluations,
+            minimum_success_rate=max(0.0, min(1.0, float(ctx.get("minimum_success_rate") or 0.0))),
+            minimum_completed_episodes=max(1, int(ctx.get("minimum_completed_episodes") or 1)),
+            maximum_mean_distance_m=max(0.0, float(ctx.get("maximum_mean_distance_m") or 0.0)),
+            minimum_scenarios=max(1, int(ctx.get("minimum_scenarios") or 1)),
+        )
+        passed = bool(qualification["passed"])
+        detail = "all thresholds passed" if passed else "; ".join(qualification["failures"])
+        return {
+            "ok": passed, "passed": passed, "qualification": qualification,
+            "qualification_path": str(qualification["path"]),
+            "report": f"PPO qualification {'PASSED' if passed else 'FAILED'}: {detail}; physical motion disarmed",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False, "passed": False, "qualification": {},
+            "qualification_path": "", "report": f"PPO qualification FAILED: {exc}",
         }

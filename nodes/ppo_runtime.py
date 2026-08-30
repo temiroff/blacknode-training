@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import html
+import importlib
 import json
+import math
 import shutil
 import textwrap
 import threading
@@ -86,54 +89,85 @@ def _torch_load(path: Path, device: torch.device) -> dict[str, Any]:
         return torch.load(path, map_location=device)
 
 
-def _environment_class() -> Any:
-    try:
-        from blacknode.pkg.blacknode_newton.rl import SO101ReachEnvironment
-    except Exception as exc:  # pragma: no cover - package loader supplies namespace
+def _environment_class(spec: dict[str, Any] | None = None) -> Any:
+    """Resolve the simulator-owned environment implementation.
+
+    New providers publish ``provider.factory`` as ``module:class``.  The legacy
+    Newton reach task remains a compatibility mapping so saved v1 workflows do
+    not need a migration.
+    """
+    provider = dict((spec or {}).get("provider") or {})
+    factory = str(provider.get("factory") or "").strip()
+    environment_type = str(provider.get("environment_type") or "").strip()
+    if not factory and environment_type == "so101-reach-v1":
+        factory = "blacknode.pkg.blacknode_newton.rl:SO101ReachEnvironment"
+    if not factory or ":" not in factory:
         raise RuntimeError(
-            "blacknode-newton/runtime must be installed and enabled for PPO training"
+            "the RL environment provider must declare factory='module:class'"
+        )
+    module_name, class_name = factory.rsplit(":", 1)
+    if not module_name.startswith("blacknode.pkg.") or not class_name.isidentifier():
+        raise ValueError("RL environment factory must reference a loaded Blacknode package")
+    try:
+        return getattr(importlib.import_module(module_name), class_name)
+    except Exception as exc:  # pragma: no cover - package diagnostics own dependency setup
+        package = str(provider.get("package") or module_name)
+        raise RuntimeError(
+            f"RL environment provider {package!r} is not installed or could not be loaded"
         ) from exc
-    return SO101ReachEnvironment
 
 
 def _validate_environment(value: dict[str, Any]) -> dict[str, Any]:
     environment = dict(value or {})
     if environment.get("kind") != "blacknode.rl-environment":
-        raise ValueError("connect the environment output from SO101ReachTask")
+        raise ValueError("connect a blacknode.rl-environment provider output")
     provider = environment.get("provider") if isinstance(environment.get("provider"), dict) else {}
-    if provider.get("environment_type") != "so101-reach-v1":
-        raise ValueError("PPO currently supports the SO-ARM101 reach environment")
+    environment_type = str(provider.get("environment_type") or "").strip()
+    if not environment_type:
+        raise ValueError("RL environment provider must declare environment_type")
+    factory = str(provider.get("factory") or "").strip()
+    if environment_type != "so101-reach-v1" and (":" not in factory or not factory.startswith("blacknode.pkg.")):
+        raise ValueError("RL environment provider must declare factory='blacknode.pkg...:Class'")
     safety = environment.get("safety") if isinstance(environment.get("safety"), dict) else {}
     if safety.get("simulation_only") is not True or safety.get("physical_motion_authorized") is not False:
         raise ValueError("PPO training requires an explicitly simulation-only, motion-disarmed environment")
+    observation = environment.get("observation") if isinstance(environment.get("observation"), dict) else {}
+    action = environment.get("action") if isinstance(environment.get("action"), dict) else {}
+    observation_dim = int(observation.get("dimension") or 0)
+    action_dim = int(action.get("dimension") or 0)
+    if observation_dim <= 0 or action_dim <= 0:
+        raise ValueError("RL environment must declare positive observation and action dimensions")
+    minimum = float(action.get("minimum", -1.0))
+    maximum = float(action.get("maximum", 1.0))
+    if not math.isfinite(minimum) or not math.isfinite(maximum) or minimum >= maximum:
+        raise ValueError("RL environment action bounds must be finite and increasing")
+    joint_names = [str(name) for name in environment.get("joint_names") or []]
+    if joint_names and len(set(joint_names)) != len(joint_names):
+        raise ValueError("RL environment joint_names must be unique and ordered")
     return environment
 
 
 def ppo_observation_contract(environment: dict[str, Any]) -> dict[str, Any]:
-    """Return the simulator-neutral observation/action contract for SO-101 reach."""
+    """Return the simulator-neutral tensor and action compatibility contract."""
     spec = _validate_environment(environment)
     joint_names = [str(name) for name in spec.get("joint_names") or []]
-    joint_count = len(joint_names)
-    if joint_count <= 0:
-        raise ValueError("PPO environment must declare ordered joint_names")
     observation = dict(spec.get("observation") or {})
     action = dict(spec.get("action") or {})
-    expected_observation = joint_count * 3 + 3
-    if int(observation.get("dimension") or 0) != expected_observation:
-        raise ValueError(
-            f"SO-ARM101 PPO observation dimension must be {expected_observation}"
-        )
-    if int(action.get("dimension") or 0) != joint_count:
-        raise ValueError("SO-ARM101 PPO action dimension must match joint_names")
-    return {
-        "kind": "blacknode.ppo-compatibility-contract",
-        "schema_version": 1,
-        "environment_type": "so101-reach-v1",
-        "robot_profile": str(spec.get("robot_profile") or "so_arm101"),
-        "joint_names": joint_names,
-        "observation": {
-            "dimension": expected_observation,
-            "fields": [
+    observation_dim = int(observation["dimension"])
+    action_dim = int(action["dimension"])
+    fields = observation.get("fields")
+    legacy_reach = str(dict(spec.get("provider") or {}).get("environment_type")) == "so101-reach-v1"
+    if legacy_reach:
+        joint_count = len(joint_names)
+        expected_observation = joint_count * 3 + 3
+        if joint_count <= 0 or observation_dim != expected_observation:
+            raise ValueError(
+                f"SO-ARM101 PPO observation dimension must be {expected_observation}"
+            )
+        if action_dim != joint_count:
+            raise ValueError("SO-ARM101 PPO action dimension must match joint_names")
+        if not fields or not all(isinstance(field, dict) for field in fields):
+            fields = [
                 {
                     "name": "normalized_joint_positions", "size": joint_count,
                     "source": "joint_positions_rad", "normalization": "joint_limits",
@@ -150,16 +184,49 @@ def ppo_observation_contract(environment: dict[str, Any]) -> dict[str, Any]:
                     "name": "previous_normalized_action", "size": joint_count,
                     "source": "previous_action", "initial": 0.0,
                 },
-            ],
+            ]
+    elif fields and all(isinstance(field, dict) for field in fields):
+        fields = [dict(field) for field in fields]
+        if sum(int(field.get("size") or 0) for field in fields) != observation_dim:
+            raise ValueError("RL observation field sizes must equal observation.dimension")
+    else:
+        fields = [{
+            "name": "provider_observation", "size": observation_dim,
+            "source": "environment_observation",
+        }]
+    action_type = str(
+        action.get("type")
+        or ("bounded_joint_position_delta" if legacy_reach else "normalized_continuous")
+    ).replace("-", "_")
+    output_application = str(action.get("output_application") or "")
+    if not output_application and action_type == "bounded_joint_position_delta":
+        output_application = "current_position_plus_scaled_delta"
+    return {
+        "kind": "blacknode.ppo-compatibility-contract",
+        "schema_version": 2,
+        "environment_type": str(dict(spec.get("provider") or {}).get("environment_type")),
+        "provider": dict(spec.get("provider") or {}),
+        "task": str(spec.get("task") or "continuous-control"),
+        "robot_profile": str(spec.get("robot_profile") or ""),
+        "joint_names": joint_names,
+        "observation": {
+            "dimension": observation_dim,
+            "fields": fields,
+            "normalization": dict(observation.get("normalization") or {}),
         },
         "action": {
-            "dimension": joint_count,
-            "type": "bounded_joint_position_delta",
+            "dimension": action_dim,
+            "type": action_type,
             "minimum": float(action.get("minimum", -1.0)),
             "maximum": float(action.get("maximum", 1.0)),
             "scale_rad": float(action.get("scale_rad") or 0.0),
-            "output_application": "current_position_plus_scaled_delta",
+            "output_application": output_application,
         },
+        "timing": {
+            "simulation_hz": int(spec.get("simulation_hz") or 0),
+            "control_hz": int(spec.get("control_hz") or 0),
+        },
+        "domain_randomization": dict(spec.get("domain_randomization") or {}),
         "safety": {"simulation_only": True, "physical_motion_authorized": False},
     }
 
@@ -183,8 +250,10 @@ class PPOPolicy:
         from .runtime import policy_artifact_info
 
         self.info = policy_artifact_info(artifact)
-        if self.info.get("policy_type") != "ppo-so101-reach":
-            raise ValueError("PPOPolicy requires a ppo-so101-reach policy artifact")
+        if self.info.get("policy_type") not in {
+            "ppo-so101-reach", "ppo-continuous-control-v1",
+        }:
+            raise ValueError("PPOPolicy requires a Blacknode continuous-control PPO artifact")
         self.contract = dict(
             self.info.get("compatibility_contract")
             or ppo_observation_contract(dict(self.info.get("environment") or {}))
@@ -207,8 +276,9 @@ class PPOPolicy:
         else:
             raise ValueError(f"unsupported PPO model_format: {self.model_format}")
         self.model.eval()
+        action_dim = int(dict(self.contract.get("action") or {}).get("dimension") or 0)
         self.previous_action = torch.zeros(
-            len(self.joint_names), device=self.device, dtype=torch.float32
+            action_dim, device=self.device, dtype=torch.float32
         )
 
     def reset(self) -> None:
@@ -256,27 +326,63 @@ class PPOPolicy:
         ):
             raise ValueError("PPO observation contains invalid joint limits")
         q = torch.tensor(qpos, device=self.device, dtype=torch.float32)
-        raw_velocities = values.get("joint_velocities")
-        velocities = (
-            [float(raw_velocities[name]) for name in self.joint_names]
-            if isinstance(raw_velocities, dict)
-            else [float(value) for value in list(raw_velocities or [])]
-        )
-        if len(velocities) != len(self.joint_names):
-            raise ValueError("PPO observation must include ordered joint velocities")
-        target = [float(value) for value in list(values.get("target_m") or [])]
-        end_effector = [float(value) for value in list(values.get("end_effector_m") or [])]
-        if len(target) != 3 or len(end_effector) != 3:
-            raise ValueError("PPO observation requires target_m and end_effector_m xyz values")
-        normalized_q = torch.clamp((q - (lower + upper) * 0.5) / ((upper - lower) * 0.5), -1.0, 1.0)
-        qd = torch.tensor(velocities, device=self.device, dtype=torch.float32) * 0.05
-        delta = (
-            torch.tensor(target, device=self.device, dtype=torch.float32)
-            - torch.tensor(end_effector, device=self.device, dtype=torch.float32)
-        ) / 0.5
-        observation = torch.cat((normalized_q, qd, delta, self.previous_action)).unsqueeze(0)
+        tensors: list[Any] = []
+        fields = list(dict(self.contract.get("observation") or {}).get("fields") or [])
+        for field in fields:
+            descriptor = dict(field) if isinstance(field, dict) else {}
+            source = str(descriptor.get("source") or "")
+            size = int(descriptor.get("size") or 0)
+            if source == "joint_positions_rad":
+                tensor = q
+                if descriptor.get("normalization") == "joint_limits":
+                    tensor = torch.clamp(
+                        (q - (lower + upper) * 0.5) / ((upper - lower) * 0.5),
+                        -1.0, 1.0,
+                    )
+            elif source == "joint_velocities_rad_s":
+                raw = values.get("joint_velocities")
+                ordered = (
+                    [float(raw[name]) for name in self.joint_names]
+                    if isinstance(raw, dict)
+                    else [float(value) for value in list(raw or [])]
+                )
+                tensor = torch.tensor(ordered, device=self.device, dtype=torch.float32)
+            elif source == "target_minus_end_effector_m":
+                target = torch.tensor(
+                    list(values.get("target_m") or []), device=self.device, dtype=torch.float32
+                )
+                end_effector = torch.tensor(
+                    list(values.get("end_effector_m") or []), device=self.device, dtype=torch.float32
+                )
+                tensor = target - end_effector
+            elif source == "previous_action":
+                tensor = self.previous_action
+            else:
+                key = "observation" if source == "environment_observation" else source
+                tensor = torch.as_tensor(
+                    values.get(key, []), device=self.device, dtype=torch.float32
+                ).reshape(-1)
+            tensor = tensor.reshape(-1)
+            if tensor.numel() != size:
+                raise ValueError(
+                    f"PPO observation source {source!r} expected {size} value(s), got {tensor.numel()}"
+                )
+            if descriptor.get("scale") is not None:
+                tensor = tensor * float(descriptor["scale"])
+            if descriptor.get("divisor") is not None:
+                divisor = float(descriptor["divisor"])
+                if divisor == 0.0:
+                    raise ValueError(f"PPO observation source {source!r} has zero divisor")
+                tensor = tensor / divisor
+            tensors.append(tensor)
+        observation = torch.cat(tensors).unsqueeze(0)
         normalized_action = self.actions_for_observation(observation)[0]
-        scale_rad = float(dict(self.contract.get("action") or {}).get("scale_rad") or 0.0)
+        action_contract = dict(self.contract.get("action") or {})
+        if action_contract.get("output_application") != "current_position_plus_scaled_delta":
+            raise ValueError("physical PPO runtime requires current_position_plus_scaled_delta actions")
+        if normalized_action.numel() != q.numel():
+            raise ValueError("physical PPO action dimension must match the robot joint count")
+        scale_rad = float(action_contract.get("scale_rad") or 0.0)
         desired = torch.clamp(q + normalized_action * scale_rad, lower, upper)
         self.previous_action.copy_(normalized_action)
         return {
@@ -370,6 +476,9 @@ class PPOTrainingJob:
                 "output_dir": self.config.output_dir,
                 "device": self.actual_device or self.config.device,
                 "environment_count": int(self.config.environment.get("environment_count") or 0),
+                "environment_type": str(dict(self.config.environment.get("provider") or {}).get("environment_type") or ""),
+                "task": str(self.config.environment.get("task") or "continuous-control"),
+                "robot_profile": str(self.config.environment.get("robot_profile") or ""),
                 "viewer_url": str(self.preview.get("viewer_url") or ""),
                 "viewer": dict(self.preview),
                 "viewer_running": viewer_running,
@@ -428,7 +537,7 @@ class PPOTrainingJob:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.config.seed)
             spec = _validate_environment(self.config.environment)
-            environment = _environment_class()(spec, device=self.config.device)
+            environment = _environment_class(spec)(spec, device=self.config.device)
             device = environment.torch_device
             self.actual_device = str(device)
             observation_dim = int(spec["observation"]["dimension"])
@@ -442,7 +551,7 @@ class PPOTrainingJob:
                         "provider": self.config.viewer_provider,
                         "port": self.config.viewer_port,
                         "environment_index": self.config.viewer_environment_index,
-                        "label": f"SO-ARM101 PPO · {self.config.run_id}",
+                        "label": f"PPO · {self.config.environment.get('task') or self.config.run_id}",
                     })
                     self._log(
                         f"training preview started at {self.preview.get('viewer_url') or 'unknown URL'}"
@@ -481,7 +590,7 @@ class PPOTrainingJob:
             with self.lock:
                 self.phase = "running"
             self._log(
-                f"started {environment_count} simulated SO-ARM101 arms on {device}; hardware disarmed"
+                f"started {environment_count} simulated {spec.get('task') or 'control'} environment(s) on {device}; hardware disarmed"
             )
             started = time.perf_counter()
             starting_steps = self.simulation_steps
@@ -502,7 +611,7 @@ class PPOTrainingJob:
                         action, latent, log_probability, value = model.sample(observation)
                     next_observation, reward, done, info = environment.step(action)
                     now = time.perf_counter()
-                    if self.config.viewer_enabled and now >= next_preview_at:
+                    if self.config.viewer_enabled and self.preview.get("running") and now >= next_preview_at:
                         preview_index = int(environment.preview_environment_index)
                         environment.render_preview({
                             "update": self.update,
@@ -608,7 +717,11 @@ class PPOTrainingJob:
                         })
                     except Exception:  # noqa: BLE001
                         pass
-                    last_preview = environment.preview_status()
+                    preview_status = getattr(environment, "preview_status", None)
+                    last_preview = (
+                        dict(preview_status()) if callable(preview_status)
+                        else {"running": False, "viewer_url": "", "error": ""}
+                    )
                     if bool(last_preview.get("running")):
                         release_batch = getattr(environment, "release_training_batch", None)
                         if callable(release_batch):
@@ -620,7 +733,11 @@ class PPOTrainingJob:
                         environment.close()
                         self.preview = {**last_preview, "running": False}
                 else:
-                    last_preview = environment.preview_status()
+                    preview_status = getattr(environment, "preview_status", None)
+                    last_preview = (
+                        dict(preview_status()) if callable(preview_status)
+                        else {"running": False, "viewer_url": "", "error": ""}
+                    )
                     environment.close()
                     self.preview = {**last_preview, "running": False, "viewer_url": ""}
             with self.lock:
@@ -716,7 +833,7 @@ class PPOReplayJob:
             spec = _validate_environment(dict(payload["environment"]))
             spec["environment_count"] = 1
             spec["seed"] = int(spec.get("seed") or 42) + 200_000
-            environment = _environment_class()(spec, device=self.config.device)
+            environment = _environment_class(spec)(spec, device=self.config.device)
             self.actual_device = str(environment.torch_device)
             model_config = PPOModelConfig.from_dict(dict(payload["model_config"]))
             model = PPOActorCritic(model_config).to(environment.torch_device)
@@ -932,7 +1049,41 @@ def checkpoint_info(checkpoint_path: str | Path) -> dict[str, Any]:
     }
 
 
-def export_policy_artifact(checkpoint_path: str | Path, output_dir: str | Path, *, overwrite: bool = False) -> dict[str, Any]:
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _contract_digest(model_path: Path, contract: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    digest.update(bytes.fromhex(_file_digest(model_path)))
+    digest.update(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def policy_artifact_digest(artifact: str | Path | dict[str, Any]) -> str:
+    from .runtime import policy_artifact_info
+
+    info = policy_artifact_info(artifact)
+    expected = str(info.get("artifact_digest") or "")
+    actual = _contract_digest(
+        Path(str(info["model_path"])), dict(info.get("compatibility_contract") or {})
+    )
+    if expected and expected != actual:
+        raise ValueError("policy artifact digest does not match its model and contract")
+    return actual
+
+
+def export_policy_artifact(
+    checkpoint_path: str | Path,
+    output_dir: str | Path,
+    *,
+    overwrite: bool = False,
+    model_format: str = "torchscript",
+) -> dict[str, Any]:
     _require_torch()
     checkpoint = Path(str(checkpoint_path or "").strip()).expanduser().resolve()
     payload = _torch_load(checkpoint, torch.device("cpu"))
@@ -942,32 +1093,52 @@ def export_policy_artifact(checkpoint_path: str | Path, output_dir: str | Path, 
     if output.exists() and any(output.iterdir()) and not overwrite:
         raise FileExistsError(f"policy artifact directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
+    requested_format = str(model_format or "torchscript").strip().lower()
+    if requested_format not in {"torchscript", "state_dict"}:
+        raise ValueError("PPO export model_format must be torchscript or state_dict")
     model_path = output / "policy.pt"
     temporary = model_path.with_suffix(".pt.tmp")
-    torch.save({
-        "kind": "blacknode.ppo-policy-model", "schema_version": 1,
-        "model_config": dict(payload["model_config"]), "model_state": payload["model_state"],
-    }, temporary)
+    if requested_format == "torchscript":
+        config = PPOModelConfig.from_dict(dict(payload["model_config"]))
+        source_model = PPOActorCritic(config)
+        source_model.load_state_dict(payload["model_state"])
+        source_model.eval()
+        actor = torch.nn.Sequential(source_model.actor, torch.nn.Tanh()).eval()
+        torch.jit.script(actor).save(str(temporary))
+        stored_format = "torchscript"
+    else:
+        torch.save({
+            "kind": "blacknode.ppo-policy-model", "schema_version": 1,
+            "model_config": dict(payload["model_config"]), "model_state": payload["model_state"],
+        }, temporary)
+        stored_format = "blacknode-ppo-state-dict"
     temporary.replace(model_path)
     environment = dict(payload["environment"])
     compatibility_contract = ppo_observation_contract(environment)
+    policy_type = "ppo-continuous-control-v1"
+    action_contract = dict(compatibility_contract["action"])
     manifest = {
-        "kind": "blacknode.policy-artifact", "schema_version": 1,
-        "policy_type": "ppo-so101-reach", "backend": "blacknode-native",
-        "model_format": "blacknode-ppo-state-dict",
+        "kind": "blacknode.policy-artifact", "schema_version": 2,
+        "policy_type": policy_type, "backend": "blacknode-native",
+        "model_format": stored_format,
         "created_at": _now(), "path": str(output), "model_file": model_path.name,
         "source_checkpoint": str(checkpoint), "step": int(payload.get("simulation_steps") or 0),
-        "update": int(payload.get("update") or 0), "task": "reach",
-        "robot_profile": "so_arm101", "action_mode": "bounded_joint_position_delta",
-        "units": "normalized", "joint_names": list(environment["joint_names"]),
+        "source_checkpoint_digest": _file_digest(checkpoint),
+        "update": int(payload.get("update") or 0),
+        "task": str(environment.get("task") or "continuous-control"),
+        "robot_profile": str(environment.get("robot_profile") or ""),
+        "action_mode": str(action_contract.get("type") or "normalized_continuous"),
+        "units": str(dict(environment.get("action") or {}).get("units") or "normalized"),
+        "joint_names": list(environment.get("joint_names") or []),
         "camera_names": [], "state_dim": int(environment["observation"]["dimension"]),
         "action_dim": int(environment["action"]["dimension"]),
         "model_config": dict(payload["model_config"]), "environment": environment,
         "compatibility_contract": compatibility_contract,
-        "compatible_simulators": ["newton", "isaac-sim"],
+        "compatible_providers": [dict(environment.get("provider") or {})],
         "metrics": dict(payload.get("metrics") or {}),
         "safety": {"simulation_only": True, "physical_motion_authorized": False},
     }
+    manifest["artifact_digest"] = _contract_digest(model_path, compatibility_contract)
     _atomic_json(output / "manifest.json", manifest)
     return {**manifest, "model_path": str(model_path)}
 
@@ -1010,8 +1181,8 @@ def import_torchscript_policy(
     shutil.copy2(source_model, temporary)
     temporary.replace(destination)
     manifest = {
-        "kind": "blacknode.policy-artifact", "schema_version": 1,
-        "policy_type": "ppo-so101-reach", "backend": "blacknode-native",
+        "kind": "blacknode.policy-artifact", "schema_version": 2,
+        "policy_type": "ppo-continuous-control-v1", "backend": "blacknode-native",
         "model_format": "torchscript", "created_at": _now(),
         "path": str(output), "model_file": destination.name,
         "source": str(source or "isaac-sim"), "source_model": str(source_model),
@@ -1021,8 +1192,10 @@ def import_torchscript_policy(
         "state_dim": observation_dim, "action_dim": action_dim,
         "environment": dict(spec), "compatibility_contract": contract,
         "compatible_simulators": ["newton", "isaac-sim"],
+        "compatible_providers": [dict(spec.get("provider") or {})],
         "safety": {"simulation_only": True, "physical_motion_authorized": False},
     }
+    manifest["artifact_digest"] = _contract_digest(destination, contract)
     _atomic_json(output / "manifest.json", manifest)
     return {**manifest, "model_path": str(destination)}
 
@@ -1037,7 +1210,7 @@ def evaluate_policy_artifact(
     spec = dict(policy.info["environment"])
     spec["environment_count"] = max(1, min(1024, int(environment_count)))
     spec["seed"] = int(spec.get("seed") or 42) + 100_000
-    environment = _environment_class()(spec, device=str(policy.device))
+    environment = _environment_class(spec)(spec, device=str(policy.device))
     try:
         observation = environment.observe()
         completed = 0
@@ -1054,6 +1227,7 @@ def evaluate_policy_artifact(
         return {
             "kind": "blacknode.ppo-evaluation", "schema_version": 1,
             "artifact": str(policy.info["path"]),
+            "artifact_digest": policy_artifact_digest(policy.info),
             "source": str(policy.info.get("source") or "blacknode"),
             "environment_count": environment.environment_count,
             "completed_episodes": completed, "successful_episodes": successful,
@@ -1065,6 +1239,88 @@ def evaluate_policy_artifact(
         }
     finally:
         environment.close()
+
+
+def qualify_policy_artifact(
+    artifact: str | Path | dict[str, Any],
+    evaluations: list[dict[str, Any]],
+    *,
+    minimum_success_rate: float = 0.8,
+    minimum_completed_episodes: int = 64,
+    maximum_mean_distance_m: float | None = None,
+    minimum_scenarios: int = 1,
+) -> dict[str, Any]:
+    """Bind simulation evidence and explicit thresholds to one immutable policy."""
+    from .runtime import policy_artifact_info
+
+    info = policy_artifact_info(artifact)
+    digest = policy_artifact_digest(info)
+    records = [dict(value) for value in evaluations if isinstance(value, dict)]
+    if len(records) < max(1, int(minimum_scenarios)):
+        raise ValueError("qualification does not include the required evaluation scenarios")
+    failures: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    for index, record in enumerate(records, start=1):
+        if record.get("kind") != "blacknode.ppo-evaluation":
+            failures.append(f"scenario {index} is not a Blacknode PPO evaluation")
+            continue
+        record_digest = str(record.get("artifact_digest") or "")
+        source_checkpoint_digest = str(record.get("source_checkpoint_digest") or "")
+        if record_digest:
+            if record_digest != digest:
+                failures.append(f"scenario {index} evaluated a different policy artifact")
+        elif (
+            not source_checkpoint_digest
+            or source_checkpoint_digest != str(info.get("source_checkpoint_digest") or "")
+        ):
+            failures.append(f"scenario {index} is not bound to this artifact or its source checkpoint")
+        completed = int(record.get("completed_episodes") or 0)
+        success_rate = float(record.get("success_rate") or 0.0)
+        distance = record.get("mean_distance_m")
+        if completed < max(1, int(minimum_completed_episodes)):
+            failures.append(
+                f"scenario {index} completed {completed} episode(s), below {minimum_completed_episodes}"
+            )
+        if success_rate < float(minimum_success_rate):
+            failures.append(
+                f"scenario {index} success {success_rate:.3f}, below {minimum_success_rate:.3f}"
+            )
+        if maximum_mean_distance_m is not None:
+            if distance is None or float(distance) > float(maximum_mean_distance_m):
+                failures.append(
+                    f"scenario {index} mean distance exceeds {float(maximum_mean_distance_m):.4f} m"
+                )
+        normalized.append({
+            "artifact_digest": record_digest or digest,
+            "source_checkpoint_digest": source_checkpoint_digest,
+            "source": str(record.get("source") or "blacknode"),
+            "environment_count": int(record.get("environment_count") or 0),
+            "completed_episodes": completed,
+            "success_rate": success_rate,
+            "mean_distance_m": None if distance is None else float(distance),
+            "mean_reward": float(record.get("mean_reward") or 0.0),
+        })
+    thresholds = {
+        "minimum_success_rate": float(minimum_success_rate),
+        "minimum_completed_episodes": max(1, int(minimum_completed_episodes)),
+        "maximum_mean_distance_m": maximum_mean_distance_m,
+        "minimum_scenarios": max(1, int(minimum_scenarios)),
+    }
+    qualification = {
+        "kind": "blacknode.policy-qualification", "schema_version": 1,
+        "created_at": _now(), "artifact_digest": digest,
+        "artifact_path": str(info["path"]), "passed": not failures,
+        "thresholds": thresholds, "evaluations": normalized,
+        "failures": failures,
+        "compatibility_contract": dict(info.get("compatibility_contract") or {}),
+        "safety": {"simulation_only": True, "physical_motion_authorized": False},
+    }
+    qualification["qualification_digest"] = hashlib.sha256(
+        json.dumps(qualification, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    output = Path(str(info["path"])) / "qualification.json"
+    _atomic_json(output, qualification)
+    return {**qualification, "path": str(output)}
 
 
 def evaluate_checkpoint(
@@ -1079,7 +1335,7 @@ def evaluate_checkpoint(
     spec = dict(payload["environment"])
     spec["environment_count"] = max(1, min(1024, int(environment_count)))
     spec["seed"] = int(spec.get("seed") or 42) + 100_000
-    environment = _environment_class()(spec, device=device_name)
+    environment = _environment_class(spec)(spec, device=device_name)
     try:
         model_config = PPOModelConfig.from_dict(dict(payload["model_config"]))
         model = PPOActorCritic(model_config).to(environment.torch_device)
@@ -1100,6 +1356,7 @@ def evaluate_checkpoint(
         return {
             "kind": "blacknode.ppo-evaluation", "schema_version": 1,
             "checkpoint": str(checkpoint), "environment_count": environment.environment_count,
+            "source_checkpoint_digest": _file_digest(checkpoint),
             "completed_episodes": completed, "successful_episodes": successful,
             "success_rate": successful / max(1, completed),
             "mean_distance_m": sum(distances) / max(1, len(distances)),
@@ -1130,12 +1387,12 @@ def dashboard(status: dict[str, Any]) -> str:
     )
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="520" height="{height}" viewBox="0 0 520 {height}">
 <rect width="100%" height="100%" rx="18" fill="#111827"/>
-<circle cx="30" cy="34" r="7" fill="{color}"/><text x="48" y="40" fill="#f9fafb" font-family="sans-serif" font-size="19" font-weight="700">SO-ARM101 PPO · {phase}</text>
+<circle cx="30" cy="34" r="7" fill="{color}"/><text x="48" y="40" fill="#f9fafb" font-family="sans-serif" font-size="19" font-weight="700">PPO · {html.escape(str(status.get('task') or 'CONTINUOUS CONTROL').upper())} · {phase}</text>
 <text x="24" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">UPDATE</text><text x="24" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{update} / {updates}</text>
 <text x="250" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">DISTANCE</text><text x="250" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{distance_text}</text>
 <text x="410" y="76" fill="#9ca3af" font-family="sans-serif" font-size="13">SUCCESS</text><text x="410" y="99" fill="#f9fafb" font-family="monospace" font-size="20">{success_text}</text>
 <rect x="24" y="122" width="472" height="14" rx="7" fill="#374151"/><rect x="24" y="122" width="{fill}" height="14" rx="7" fill="{color}"/>
-<text x="24" y="166" fill="#d1d5db" font-family="sans-serif" font-size="13">Newton/Warp simulation · physical SO-ARM101 remains disarmed</text>
+<text x="24" y="166" fill="#d1d5db" font-family="sans-serif" font-size="13">Vectorized simulation · physical motion remains disarmed</text>
 {error_svg}</svg>'''
     return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
 
@@ -1153,7 +1410,7 @@ def node_outputs(status: dict[str, Any]) -> dict[str, Any]:
         "replay_episodes": int(status.get("replay_episodes") or 0),
         "checkpoint": str(status.get("checkpoint") or ""),
         "report": (
-            f"SO-ARM101 PPO {phase}: "
+            f"PPO {status.get('task') or 'continuous-control'} {phase}: "
             + (
                 f"episode {int(status.get('replay_episode') or 0)}/"
                 f"{int(status.get('replay_episodes') or 0)}, checkpoint update "
